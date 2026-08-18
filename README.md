@@ -19,9 +19,8 @@ version automatically, so no system Python upgrade or conda is needed.
 
 ```bash
 # from the repo root
-uv venv --python 3.12 .venv
+uv sync --extra dev
 source .venv/bin/activate
-uv pip install "lerobot[libero]"
 ```
 
 ### GPU / CUDA
@@ -32,18 +31,19 @@ Check that the installed torch matches your driver:
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-`lerobot` pulls a CUDA 13 build of torch by default. That requires a driver from the
-580 series or newer — on an older driver `torch.cuda.is_available()` silently returns
-`False` and everything falls back to CPU. Install a matching build instead:
+This should print `2.11.0+cu128` and `True`. If it prints a bare `2.11.0` and `False`,
+torch was resolved from PyPI rather than the CUDA 12.8 index.
+
+PyPI serves a **cu130** build, which needs an NVIDIA driver from the 580 series. On
+anything older, `torch.cuda.is_available()` returns `False` and everything falls back
+to CPU — no exception, no failure, just a training run roughly 50x slower than it
+should be. `uv sync` avoids this by installing the pinned `+cu128` build. To repair an
+environment that already has the wrong one:
 
 ```bash
-# CUDA 12.8 build (works on 12.x drivers; required for Blackwell / RTX 50-series)
 uv pip install --index-url https://download.pytorch.org/whl/cu128 \
   "torch==2.11.0+cu128" "torchvision==0.26.0+cu128"
 ```
-
-RTX 50-series (Blackwell, `sm_120`) needs CUDA 12.8 or newer — a `cu126` build will
-not run on it.
 
 ### Rendering backend
 

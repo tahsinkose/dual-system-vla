@@ -1,0 +1,50 @@
+[project]
+name = "dual-system-vla"
+version = "0.1.0"
+description = "A dual-system vision-language-action architecture evaluated on LIBERO"
+requires-python = ">=3.12"
+
+# Everything imported directly by this project is listed, even where it also arrives
+# transitively through lerobot. Relying on a transitive dependency means an upstream
+# release can remove it and break this project for reasons that look unrelated.
+dependencies = [
+    "lerobot[libero]>=0.6.1",   # datasets, LIBERO/MuJoCo simulation, torch stack
+    # torch and torchvision are declared explicitly even though lerobot pulls them in:
+    # [tool.uv.sources] below only redirects *direct* dependencies, so leaving them
+    # transitive silently resolves them from PyPI and reintroduces the cu130 trap.
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "peft>=0.20",               # LoRA adapters for System 2
+    "transformers>=5.5",        # Qwen2.5-VL backbone
+    "h5py>=3.10",               # reads LIBERO's original HDF5 demonstrations
+    "huggingface-hub>=0.30",    # streams those HDF5 files without full download
+    "imageio>=2.34",            # rollout / replay videos
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+# ---------------------------------------------------------------------------------
+# torch must come from the CUDA 12.8 index, not PyPI.
+#
+# PyPI serves a cu130 build, which requires an NVIDIA driver from the 580 series.
+# On an older driver `torch.cuda.is_available()` silently returns False and everything
+# falls back to CPU — no error, no warning beyond a single startup message, just a
+# training run that is ~50x slower than it should be. Both machines this project runs
+# on are below that threshold (535 and 570), so the default would break both.
+#
+# `explicit = true` confines this index to the packages named below, so nothing else
+# is accidentally resolved from it.
+# ---------------------------------------------------------------------------------
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+
+[tool.setuptools]
+packages = ["src"]

@@ -188,3 +188,56 @@ def load_episode(dataset, episode_index: int):
     return str(instruction), actions, state
 
 
+# ----------------------------------------------------------------- initial states
+
+
+def init_states_path() -> Path:
+    """Single archive mapping every episode index to its 8-float initial state."""
+    return INIT_STATES_DIR / "init_states.npz"
+
+
+def load_exact_init_state(episode_index: int):
+    """This episode's recorded initial simulator state, or None if not yet extracted.
+
+    The dataset does not carry simulator state; these come from LIBERO's original
+    demonstrations via scripts/extract_init_states.py.
+    """
+    import numpy as np
+
+    path = init_states_path()
+    if not path.exists():
+        return None
+    with np.load(path) as archive:
+        key = str(episode_index)
+        return archive[key] if key in archive else None
+
+
+# ------------------------------------------------------------------------ rendering
+
+
+def agentview_upright(frame):
+    """Orient a raw agentview render to match the dataset's frames.
+
+    MuJoCo's buffer is rotated 180 degrees relative to how LIBERO recorded these
+    demonstrations — not merely flipped vertically. Measured against a dataset frame:
+    rot180 gives 0.047 mean absolute error, a vertical flip alone 0.139.
+    """
+    return frame[::-1, ::-1]
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT))
+    from src.env_setup import setup_env
+
+    setup_env()
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    repo = sys.argv[1] if len(sys.argv) > 1 else "lerobot/libero_10"
+    mapping = TaskMapping.from_dataset(LeRobotDataset(repo))
+    print(f"{repo}: {len(mapping)} tasks\n")
+    print(mapping.format_table())
+    coinciding = sum(1 for i in mapping.dataset_indices()
+                     if mapping.by_dataset_index(i).benchmark_id == i)
+    print(f"\nindices that coincide: {coinciding}/{len(mapping)}")

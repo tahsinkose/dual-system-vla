@@ -15,7 +15,9 @@ wandb/
 *.safetensors
 
 # Datasets and caches
-data/
+data/*
+!data/init_states.npz
+!data/unmatched_episodes_per_task.json
 *.hdf5
 *.parquet
 

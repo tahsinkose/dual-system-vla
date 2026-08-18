@@ -84,3 +84,22 @@ The dataset's `task_index` and the LIBERO benchmark's task id are two different
 orderings over the same tasks, sharing no fixed points — passing one where the other
 is expected silently evaluates a different task. `src/utils.py` holds the adapter that
 reconciles them, joining on the instruction string.
+
+## Initial simulator states
+
+The LeRobot dataset drops the MuJoCo state each demonstration started from; LIBERO's
+original HDF5 demos keep it (`states[0]`), and `scripts/extract_init_states.py`
+recovers it via exact action-sequence matching into `data/init_states.npz`.
+
+`data/init_states.npz` and `data/unmatched_episodes_per_task.json` ship pre-extracted
+and committed, so **it is not necessary to run the extraction script again** — only
+re-run it if you switch to a different dataset or LIBERO suite:
+
+```bash
+python scripts/extract_init_states.py                    # all ten tasks (default)
+python scripts/extract_init_states.py --task-index 5     # or just one
+```
+
+Not every episode has a match (61 of 379, listed in
+`data/unmatched_episodes_per_task.json`) — a gap in the dataset's own conversion that
+doesn't affect training, only which episodes can be replayed exactly.

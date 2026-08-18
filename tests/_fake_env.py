@@ -74,9 +74,12 @@ class _FakeRobosuiteEnv:
 class FakeLiberoEnv:
     """Minimal double for `OffScreenRenderEnv`.
 
-    `success_at_steps`: the set of `.step()` call indices (0-indexed) at which
-    `check_success()` should report True from then on until reset — tests script task
-    completion directly rather than simulating real physics.
+    `success_at_steps`: the exact set of step indices (0-indexed, matching the
+    caller's own loop counter) at which `check_success()` reports True — *not*
+    latching, since real task success can go True (achieved) -> False (disrupted by
+    a perturbation) -> True again (re-achieved). Latching "did it ever succeed" is
+    the caller's job (eval/run_eval.py does this itself), matching how
+    scripts/replay_episode.py documents real `check_success()` behaviour.
     """
 
     obj_of_interest: list[str] = field(default_factory=lambda: ["target_object_1"])
@@ -137,7 +140,7 @@ class FakeLiberoEnv:
         return self._observation(), 0.0, done, {}
 
     def check_success(self) -> bool:
-        return any(step <= self._step_count - 1 for step in self.success_at_steps) if self._step_count else False
+        return self._step_count > 0 and (self._step_count - 1) in self.success_at_steps
 
     def close(self) -> None:
         self.closed = True

@@ -27,3 +27,5 @@ data/
 .vscode/
 .idea/
 .DS_Store
+
+configs/libero/config.yaml

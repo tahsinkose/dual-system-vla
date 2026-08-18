@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1650 1060" font-family="Helvetica, Arial, sans-serif">
+  <title>Dual-System VLA: System 2 to System 1</title>
+  <desc>Frozen Qwen2.5-VL-3B backbone conditions System 1 through one pooled latent z, drawn sitting on the boundary between the two systems as the only tensor that crosses it. Only the LoRA adapters and the small latent head train; gradients from System 1's action loss travel back through that same z and reach only those two places, never the vision encoder or the rest of the decoder. System 2 runs every K steps (~1-2 Hz); System 1 runs every env step (~20 Hz) and never receives language input directly.</desc>
+
+  <defs>
+    <marker id="arrowBlack" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1a1a1a"/>
+    </marker>
+    <marker id="arrowAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#c9781a"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1650" height="1060" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="40" y="45" font-size="24" font-weight="700" fill="#1a1a1a">Dual-System VLA — System 2 → System 1</text>
+  <text x="40" y="70" font-size="14" fill="#555555">z sits on the boundary: the one tensor that crosses between the two systems.</text>
+
+  <!-- Instruction (constant per episode) -->
+  <rect x="40" y="95" width="170" height="70" rx="10" fill="#eef2ff" stroke="#3b5bdb" stroke-width="1.5"/>
+  <text x="125" y="125" text-anchor="middle" font-size="13" font-weight="700" fill="#1a1a1a">task instruction</text>
+  <text x="125" y="145" text-anchor="middle" font-size="11" fill="#33415c">constant per episode</text>
+
+  <!-- ENV -->
+  <rect x="40" y="490" width="150" height="170" rx="12" fill="#e8f0fe" stroke="#3b5bdb" stroke-width="2"/>
+  <text x="115" y="560" text-anchor="middle" font-size="16" font-weight="700" fill="#1a1a1a">ENV</text>
+  <text x="115" y="580" text-anchor="middle" font-size="12" fill="#33415c">LIBERO /</text>
+  <text x="115" y="596" text-anchor="middle" font-size="12" fill="#33415c">MuJoCo</text>
+
+  <!-- ===================== SYSTEM 2 ===================== -->
+  <rect x="250" y="175" width="1360" height="345" rx="16" fill="#fdf6ec" stroke="#c98a2b" stroke-width="2"/>
+  <text x="270" y="205" font-size="17" font-weight="700" fill="#1a1a1a">SYSTEM 2 — Qwen2.5-VL-3B backbone</text>
+  <text x="270" y="225" font-size="13" fill="#7a5b1e">every K env steps · ~1–2 Hz</text>
+
+  <rect x="290" y="250" width="220" height="100" rx="10" fill="#eef0f3" stroke="#8a94a3" stroke-width="1.5"/>
+  <text x="400" y="295" text-anchor="middle" font-size="13" font-weight="700" fill="#1a1a1a">Vision Encoder</text>
+  <text x="400" y="313" text-anchor="middle" font-size="11" fill="#4a5568">frozen — untouched</text>
+
+  <rect x="560" y="245" width="480" height="230" rx="10" fill="#eef0f3" stroke="#8a94a3" stroke-width="1.5"/>
+  <text x="800" y="280" text-anchor="middle" font-size="14" font-weight="700" fill="#1a1a1a">Qwen2.5 LM Decoder</text>
+  <text x="800" y="298" text-anchor="middle" font-size="11" fill="#4a5568">frozen backbone · ×N layers</text>
+
+  <rect x="580" y="400" width="440" height="60" rx="8" fill="#ffe6bf" stroke="#c9781a" stroke-width="1.5"/>
+  <text x="800" y="425" text-anchor="middle" font-size="12" font-weight="700" fill="#1a1a1a">attention q/k/v/o proj — LoRA r=16</text>
+  <text x="800" y="443" text-anchor="middle" font-size="10" fill="#7a4a12">only trainable part of the backbone</text>
+
+  <rect x="1080" y="290" width="100" height="50" rx="8" fill="#eef0f3" stroke="#8a94a3" stroke-width="1.5"/>
+  <text x="1130" y="311" text-anchor="middle" font-size="12" font-weight="700" fill="#1a1a1a">pool</text>
+  <text x="1130" y="327" text-anchor="middle" font-size="10" fill="#4a5568">mean / last</text>
+
+  <rect x="1230" y="270" width="180" height="90" rx="10" fill="#ffe6bf" stroke="#c9781a" stroke-width="2"/>
+  <text x="1320" y="303" text-anchor="middle" font-size="13" font-weight="700" fill="#1a1a1a">latent head</text>
+  <text x="1320" y="321" text-anchor="middle" font-size="11" fill="#7a4a12">trainable · fp32</text>
+  <text x="1320" y="337" text-anchor="middle" font-size="10" fill="#7a4a12">LayerNorm → Linear</text>
+
+  <!-- System 2 internal arrows -->
+  <path d="M210,130 L535,130 L535,340 L560,340" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
+  <text x="535" y="122" text-anchor="middle" font-size="10" fill="#33415c">text tokens</text>
+
+  <path d="M510,300 L560,300" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
+  <text x="535" y="292" text-anchor="middle" font-size="10" fill="#33415c">image tokens</text>
+
+  <path d="M115,490 L115,300 L290,300" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
+  <text x="200" y="292" text-anchor="middle" font-size="10" fill="#33415c">image(t−Δ)</text>
+
+  <path d="M1040,360 L1080,315" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
+  <path d="M1180,315 L1230,315" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
+
+  <!-- ===================== THE BOUNDARY: z sits here, between the two frames ===================== -->
+  <path d="M1320,360 L1320,585 L1035,585" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
+  <path d="M975,585 L690,585 L690,755" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
+
+  <path d="M1360,855 L1610,855 L1610,535 L800,535" fill="none" stroke="#c9781a" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <path d="M1350,535 L1350,360" fill="none" stroke="#c9781a" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arrowAmber)"/>
+  <path d="M800,535 L800,460" fill="none" stroke="#c9781a" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arrowAmber)"/>
+  <text x="1150" y="528" text-anchor="middle" font-size="11" font-weight="700" fill="#c9781a">gradient → LoRA + latent head only (backbone stays frozen)</text>
+
+  <circle cx="1005" cy="585" r="30" fill="#ffffff" stroke="#1a1a1a" stroke-width="2.5"/>
+  <text x="1005" y="591" text-anchor="middle" font-size="18" font-weight="700" fill="#1a1a1a">z</text>
+  <text x="1005" y="628" text-anchor="middle" font-size="11" fill="#555555">the only tensor crossing this boundary</text>
+
+  <!-- ===================== SYSTEM 1 ===================== -->
+  <rect x="250" y="650" width="1360" height="320" rx="16" fill="#fff6e9" stroke="#c9781a" stroke-width="2"/>
+  <text x="270" y="680" font-size="17" font-weight="700" fill="#1a1a1a">SYSTEM 1 — cross-attention encoder–decoder</text>
+  <text x="270" y="700" font-size="13" fill="#7a4a12">every env step · ~20 Hz · trained from scratch</text>
+
+  <rect x="290" y="720" width="220" height="90" rx="10" fill="#ffffff" stroke="#c9781a" stroke-width="1.5"/>
+  <text x="400" y="758" text-anchor="middle" font-size="13" font-weight="700" fill="#1a1a1a">conv multi-scale</text>
+  <text x="400" y="776" text-anchor="middle" font-size="13" font-weight="700" fill="#1a1a1a">backbone</text>
+
+  <rect x="580" y="755" width="220" height="90" rx="10" fill="#ffffff" stroke="#c9781a" stroke-width="1.5"/>
+  <text x="690" y="785" text-anchor="middle" font-size="12" font-weight="700" fill="#1a1a1a">project z → S1 tokens</text>
+  <text x="690" y="803" text-anchor="middle" font-size="12" font-weight="700" fill="#1a1a1a">concat (seq dim)</text>
+  <text x="690" y="821" text-anchor="middle" font-size="10" fill="#7a4a12">held constant between S2 updates</text>
+
+  <rect x="870" y="720" width="340" height="150" rx="10" fill="#ffffff" stroke="#c9781a" stroke-width="2"/>
+  <text x="1040" y="760" text-anchor="middle" font-size="14" font-weight="700" fill="#1a1a1a">cross-attention</text>
+  <text x="1040" y="780" text-anchor="middle" font-size="14" font-weight="700" fill="#1a1a1a">encoder–decoder</text>
+  <text x="1040" y="802" text-anchor="middle" font-size="11" fill="#4a5568">~80M params, conv-init</text>
+  <text x="1040" y="822" text-anchor="middle" font-size="11" font-weight="700" fill="#8a3a00">no language input</text>
+
+  <rect x="1260" y="755" width="200" height="80" rx="10" fill="#ffe6bf" stroke="#c9781a" stroke-width="2"/>
+  <text x="1360" y="785" text-anchor="middle" font-size="13" font-weight="700" fill="#1a1a1a">action chunk</text>
+  <text x="1360" y="803" text-anchor="middle" font-size="11" fill="#7a4a12">N × Box(-1,1)⁷</text>
+
+  <text x="1360" y="850" text-anchor="middle" font-size="11" fill="#7a4a12">loss ℒ(action)</text>
+
+  <!-- System 1 internal arrows -->
+  <path d="M510,745 L870,745" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
+  <text x="690" y="737" text-anchor="middle" font-size="10" fill="#33415c">visual tokens</text>
+
+  <path d="M800,800 L870,790" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
+  <text x="835" y="812" text-anchor="middle" font-size="10" fill="#33415c">z tokens</text>
+
+  <path d="M1210,795 L1260,795" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
+
+  <!-- ENV -> System 1 inputs -->
+  <path d="M190,570 L225,570 L225,765 L290,765" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
+  <text x="257" y="758" text-anchor="middle" font-size="10" fill="#33415c">image, image2</text>
+
+  <path d="M190,610 L250,610 L250,845 L870,845" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
+  <text x="400" y="838" text-anchor="middle" font-size="10" fill="#33415c">state(t) — 8-dim</text>
+
+  <!-- action chunk -> ENV (closes the loop) -->
+  <path d="M1460,795 L1580,795 L1580,1015 L115,1015 L115,660" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
+  <text x="847" y="1007" text-anchor="middle" font-size="11" fill="#33415c">actions → env.step(), ~20 Hz</text>
+
+  <!-- Caption -->
+  <text x="40" y="1030" font-size="14" fill="#1a1a1a">z is drawn on the line between the two systems because it is the only tensor that crosses it — forward as the sole conditioning signal, backward as the sole gradient path.</text>
+  <text x="40" y="1050" font-size="13" fill="#555555">System 2 runs every K steps (~1–2 Hz); System 1 runs every env step (~20 Hz) and never receives language input directly.</text>
+</svg>

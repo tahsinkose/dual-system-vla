@@ -1,0 +1,29 @@
+# Python environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Training / evaluation artifacts
+outputs/
+checkpoints/
+eval_logs/
+wandb/
+*.ckpt
+*.pt
+*.safetensors
+
+# Datasets and caches
+data/
+*.hdf5
+*.parquet
+
+# Rollout media
+*.mp4
+*.gif
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

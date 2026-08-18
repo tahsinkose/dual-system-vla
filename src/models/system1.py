@@ -25,6 +25,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 from torchvision.models import ResNet18_Weights, resnet18
+from torchvision.ops.misc import FrozenBatchNorm2d
 
 # ImageNet statistics from torchvision, required because the backbone is ImageNet-initialised.
 IMAGENET_MEAN = ResNet18_Weights.IMAGENET1K_V1.transforms().mean
@@ -83,7 +84,17 @@ class MultiScaleBackbone(nn.Module):
     def __init__(self, config: System1Config) -> None:
         super().__init__()
         weights = ResNet18_Weights.IMAGENET1K_V1 if config.pretrained_backbone else None
-        resnet = resnet18(weights=weights)
+        # FrozenBatchNorm keeps the ImageNet statistics fixed rather than re-estimating
+        # them — what ACT and DETR do, for three reasons that all apply here:
+        #   * BatchNorm is one of the few layers that behaves *differently* in train and
+        #     eval mode (batch statistics vs accumulated running ones). Drift between the
+        #     two shows up as a policy that evaluates worse than it trained, with nothing
+        #     obvious to point at.
+        #   * Rollouts step one environment at a time, so batch statistics would be
+        #     computed over a single sample.
+        #   * ImageNet statistics are a better prior than ones re-estimated from a few
+        #     hundred episodes of narrow robot data at modest batch sizes.
+        resnet = resnet18(weights=weights, norm_layer=FrozenBatchNorm2d)
 
         self.stem = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
         self.layer1, self.layer2 = resnet.layer1, resnet.layer2

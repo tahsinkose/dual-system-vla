@@ -121,3 +121,37 @@ def test_latent_dim_must_match_system2():
 def test_default_size_is_in_the_intended_range():
     counts = System1(System1Config(pretrained_backbone=False)).parameter_counts()
     assert 50e6 < counts["total"] < 100e6, f"unexpected size: {counts['total'] / 1e6:.1f}M"
+
+
+def test_backbone_normalisation_is_frozen():
+    """BatchNorm statistics must not drift between training and rollout.
+
+    BatchNorm is one of the few layers that behaves *differently* in the two modes:
+    batch statistics while training, accumulated running statistics at evaluation. If
+    they diverge the policy silently evaluates worse than it trained. Rollouts also
+    step a single environment, so batch statistics would be computed over one sample.
+    ACT and DETR freeze them for the same reasons.
+    """
+    from torchvision.ops.misc import FrozenBatchNorm2d
+
+    backbone = System1(tiny_config()).backbone
+    norms = [m for m in backbone.modules()
+             if isinstance(m, (torch.nn.BatchNorm2d, FrozenBatchNorm2d))]
+    assert norms, "no normalisation layers found in the backbone"
+    assert all(isinstance(m, FrozenBatchNorm2d) for m in norms), \
+        "backbone still uses trainable BatchNorm"
+
+
+def test_backbone_output_is_mode_independent():
+    """The observable consequence: identical features in train and eval mode."""
+    model = System1(tiny_config())
+    frame = torch.rand(4, 3, 64, 64)
+
+    model.train()
+    with torch.no_grad():
+        training_features = model.backbone(frame)
+    model.eval()
+    with torch.no_grad():
+        eval_features = model.backbone(frame)
+
+    torch.testing.assert_close(training_features, eval_features)

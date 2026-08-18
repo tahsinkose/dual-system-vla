@@ -103,3 +103,22 @@ python scripts/extract_init_states.py --task-index 5     # or just one
 Not every episode has a match (61 of 379, listed in
 `data/unmatched_episodes_per_task.json`) — a gap in the dataset's own conversion that
 doesn't affect training, only which episodes can be replayed exactly.
+
+### Replaying a recorded demonstration
+
+`scripts/replay_episode.py` steps a dataset episode's recorded actions through the
+simulator and reports whether the task is solved and how closely the end-effector
+tracks the recording — the ground-truth check that the dataset's action convention
+and control rate are right, since a demonstration that can't be replayed means no
+policy trained on it could succeed either.
+
+```bash
+python scripts/replay_episode.py --episode 8
+python scripts/replay_episode.py --episode 8 --viewer            # watch it live
+python scripts/replay_episode.py --episode 13 --video out/ep13.mp4
+```
+
+A correct replay reaches task success with roughly 0.007 m mean tracking error. An
+episode whose initial state was never matched still runs, but starts from the
+environment's own reset and will almost certainly fail — the output says so
+explicitly.

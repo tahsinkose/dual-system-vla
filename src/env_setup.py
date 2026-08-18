@@ -16,6 +16,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIBERO_CONFIG_DIR = REPO_ROOT / "configs" / "libero"
 LEROBOT_HOME = REPO_ROOT / "data" / "lerobot"
+HF_HOME = REPO_ROOT / "data" / "huggingface"
 
 
 def _installed_libero_root() -> Path:
@@ -37,6 +38,22 @@ def ensure_lerobot_home() -> Path:
     os.environ["HF_LEROBOT_HOME"] = str(LEROBOT_HOME)
     LEROBOT_HOME.mkdir(parents=True, exist_ok=True)
     return LEROBOT_HOME
+
+
+def ensure_hf_home() -> Path:
+    """Point the HuggingFace cache at ``data/huggingface`` inside the repo.
+
+    ``HF_LEROBOT_HOME`` only covers LeRobot *datasets*. Pretrained model weights are
+    fetched by ``transformers``/``huggingface_hub``, which read ``HF_HOME`` instead —
+    so without this the ~7.5GB System 2 backbone lands in the user's home directory
+    while the dataset sits in the repo, splitting the project across two filesystems.
+
+    Must run before ``transformers`` or ``huggingface_hub`` is imported: both read the
+    variable once, at import.
+    """
+    os.environ["HF_HOME"] = str(HF_HOME)
+    HF_HOME.mkdir(parents=True, exist_ok=True)
+    return HF_HOME
 
 
 def link_libero_assets() -> Path | None:

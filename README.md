@@ -71,6 +71,23 @@ python scripts/smoke_test.py --only mujoco      # a single check
 
 It exits non-zero if any check fails, so it can gate a setup script or CI.
 
+## Dataset
+
+This study uses **`lerobot/libero_10`** — the LIBERO-10 (long-horizon) suite, and only
+that suite. 0.65 GB, 379 episodes, 101,469 frames, 10 tasks at 10 fps.
+
+```bash
+python scripts/download_dataset.py
+```
+
+The script fetches the slice, then prints the feature shapes, the task list with
+per-task episode counts, and the dataset→benchmark id mapping, so the download can be confirmed before anything depends on it. Everything else auto-downloads on first use, but running this explicitly makes the step visible and verifiable.
+
+Files land in `data/lerobot/` inside the repo rather than `~/.cache`, because
+`src/env_setup.py` points `HF_LEROBOT_HOME` there. That variable is read once when
+`lerobot` is imported, which is why every entry point calls `setup_env()` before
+importing it — fetching the dataset any other way puts it in your home cache instead.
+
 ## Handling Dataset vs. Benchmark ID mismatch
 
 Unit tests cover the dataset/simulator task mapping:

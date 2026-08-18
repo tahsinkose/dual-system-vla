@@ -55,3 +55,18 @@ export MUJOCO_GL=glfw   # on-screen: the interactive viewer
 ```
 
 Every headless script below assumes `egl`. The GUI script sets `glfw` itself.
+
+## Verifying the install
+
+One script checks everything later stages depend on — dependency versions and the
+torch/driver CUDA match, the lerobot API surface, MuJoCo headless rendering, and LIBERO
+env construction with simulator state injection. A failure here is much cheaper to
+diagnose than the same failure inside a training run.
+
+```bash
+python scripts/smoke_test.py                    # everything
+python scripts/smoke_test.py --quick            # skip the slow LIBERO env build
+python scripts/smoke_test.py --only mujoco      # a single check
+```
+
+It exits non-zero if any check fails, so it can gate a setup script or CI.

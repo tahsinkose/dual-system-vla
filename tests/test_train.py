@@ -1,0 +1,210 @@
+"""Tests for the training loop.
+
+Concentrated on the parts that are wrong *silently* — the padding mask and the
+temporal offset both produce a perfectly healthy-looking loss curve when broken.
+
+Run with::
+
+    python -m pytest tests/test_train.py -v
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.train import (  # noqa: E402
+    DATASET_MAIN_CAMERA,
+    DATASET_WRIST_CAMERA,
+    TrainConfig,
+    build_delta_timestamps,
+    build_model,
+    build_optimizer,
+    masked_l1_loss,
+    parse_args,
+    split_batch,
+)
+
+FPS = 10.0
+
+
+# ------------------------------------------------------------------ padding mask
+
+
+def test_padding_steps_are_excluded():
+    """Padded chunk steps must not contribute, however wrong they are."""
+    predicted = torch.zeros(1, 4, 7)
+    target = torch.zeros(1, 4, 7)
+    target[0, 2:] = 100.0                      # nonsense, but flagged as padding
+    is_pad = torch.tensor([[False, False, True, True]])
+    assert masked_l1_loss(predicted, target, is_pad).item() == pytest.approx(0.0)
+
+
+def test_loss_is_a_mean_over_valid_steps_only():
+    """The divisor is the valid count, not the full chunk.
+
+    Dividing by the full chunk would shrink the loss as episodes near their end,
+    quietly down-weighting exactly the steps that decide task success.
+    """
+    predicted = torch.zeros(1, 4, 7)
+    target = torch.ones(1, 4, 7)
+    is_pad = torch.tensor([[False, False, True, True]])
+    # Every valid element is off by 1, so the mean over valid elements is 1.0.
+    assert masked_l1_loss(predicted, target, is_pad).item() == pytest.approx(1.0)
+
+
+def test_all_padding_does_not_divide_by_zero():
+    loss = masked_l1_loss(torch.zeros(1, 2, 7), torch.ones(1, 2, 7),
+                          torch.tensor([[True, True]]))
+    assert torch.isfinite(loss)
+
+
+def test_shape_mismatch_raises_instead_of_broadcasting():
+    """A chunk-size mismatch must fail loudly, not broadcast into a wrong loss."""
+    with pytest.raises(ValueError, match="does not match target"):
+        masked_l1_loss(torch.zeros(1, 4, 7), torch.zeros(1, 16, 7),
+                       torch.zeros(1, 16, dtype=torch.bool))
+
+
+# --------------------------------------------------------------- temporal offset
+
+
+def test_delta_timestamps_request_the_offset_frame_pair():
+    """System 2 must be fed `t - Δ` and System 1 `t`, from one sample."""
+    cfg = TrainConfig(chunk_size=4, temporal_offset=2)
+    deltas = build_delta_timestamps(cfg, FPS)
+    assert deltas["action"] == [0.0, 0.1, 0.2, 0.3]
+    assert deltas[DATASET_MAIN_CAMERA] == [-0.2, 0.0]
+
+
+def test_zero_offset_still_requests_two_frames():
+    """Δ=0 is a valid ablation of the offset itself; it must not collapse the pair."""
+    deltas = build_delta_timestamps(TrainConfig(chunk_size=2, temporal_offset=0), FPS)
+    assert deltas[DATASET_MAIN_CAMERA] == [0.0, 0.0]
+
+
+def test_split_batch_routes_the_two_frames_correctly():
+    """The offset is only real if the *older* frame reaches System 2.
+
+    Swapping these silently trains System 2 on the fresh frame and System 1 on the
+    stale one — the exact inverse of the deployment condition it exists to reproduce.
+    """
+    batch_size, size = 2, 8
+    older = torch.zeros(batch_size, 3, size, size)      # t - Δ
+    newer = torch.ones(batch_size, 3, size, size)       # t
+    batch = {
+        DATASET_MAIN_CAMERA: torch.stack([older, newer], dim=1),
+        DATASET_WRIST_CAMERA: torch.full((batch_size, 3, size, size), 0.5),
+        "observation.state": torch.zeros(batch_size, 8),
+        "action": torch.zeros(batch_size, 4, 7),
+        "action_is_pad": torch.zeros(batch_size, 4, dtype=torch.bool),
+        "task": ["do the thing"] * batch_size,
+    }
+    observation, system2_frames, actions, is_pad, instructions = split_batch(batch)
+
+    assert all(float(f.mean()) == pytest.approx(0.0) for f in system2_frames), \
+        "System 2 received the fresh frame instead of the offset one"
+    assert float(observation.images["image"].mean()) == pytest.approx(1.0), \
+        "System 1 received the stale frame instead of the current one"
+    assert float(observation.images["image2"].mean()) == pytest.approx(0.5)
+    assert actions.shape == (batch_size, 4, 7)
+    assert is_pad.shape == (batch_size, 4)
+    assert instructions == ["do the thing"] * batch_size
+
+
+# ------------------------------------------------------------------- optimisation
+
+
+def test_optimizer_separates_the_two_learning_rates():
+    """System 1 trains from scratch; System 2's adapters sit on a pretrained encoder."""
+    cfg = TrainConfig(tiny=True, chunk_size=4, lr_system1=1e-4, lr_system2=1e-5)
+    optimizer = build_optimizer(build_model(cfg), cfg)
+    assert [g["lr"] for g in optimizer.param_groups] == [1e-4, 1e-5]
+    assert all(g["params"] for g in optimizer.param_groups), "an empty parameter group"
+
+
+def test_only_trainable_parameters_are_optimised():
+    """The frozen VLM backbone must not be handed to AdamW."""
+    cfg = TrainConfig(tiny=True, chunk_size=4)
+    model = build_model(cfg)
+    optimized = {id(p) for g in build_optimizer(model, cfg).param_groups for p in g["params"]}
+    frozen = [p for p in model.parameters() if not p.requires_grad]
+    assert frozen, "expected a frozen backbone"
+    assert not (optimized & {id(p) for p in frozen})
+
+
+def test_tiny_model_chunk_size_follows_the_config():
+    """The tiny defaults must not silently disagree with the dataloader."""
+    model = build_model(TrainConfig(tiny=True, chunk_size=9))
+    assert model.config.system1.chunk_size == 9
+
+
+def test_a_training_step_moves_system2_adapters():
+    """End to end: one optimiser step must change System 2, not just System 1.
+
+    If the latent path were broken the loss would still fall — System 1 alone can fit
+    a little — while System 2 sat frozen. That is the failure this catches.
+    """
+    cfg = TrainConfig(tiny=True, chunk_size=4, lr_system1=1e-3, lr_system2=1e-3)
+    model = build_model(cfg)
+    optimizer = build_optimizer(model, cfg)
+
+    lora = {n: p for n, p in model.system2.named_parameters()
+            if p.requires_grad and "lora" in n.lower()}
+    before = {n: p.detach().clone() for n, p in lora.items()}
+
+    images = {k: torch.rand(2, 3, 32, 32) for k in model.config.system1.camera_keys}
+    predicted, _ = model(images, torch.rand(2, 8), [torch.rand(3, 32, 32)] * 2,
+                         ["do the thing"] * 2)
+    loss = masked_l1_loss(predicted, torch.rand(2, 4, 7), torch.zeros(2, 4, dtype=torch.bool))
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+
+    assert any(not torch.equal(before[n], p) for n, p in lora.items()), \
+        "an optimiser step left System 2 unchanged"
+
+
+# --------------------------------------------------------------------------- cli
+
+
+def test_cli_produces_the_two_training_conditionings():
+    assert parse_args(["--conditioning", "live"]).conditioning == "live"
+    assert parse_args(["--conditioning", "static"]).conditioning == "static"
+
+
+def test_cli_rejects_test_time_only_conditionings():
+    """`frozen`, `zero` and `scene_blind` are evaluation interventions, not runs."""
+    with pytest.raises(SystemExit):
+        parse_args(["--conditioning", "frozen"])
+
+
+def test_loss_matches_acts_formulation():
+    """Our masked L1 is ACT's reconstruction loss, elementwise identical.
+
+    ACT computes it as `(abs_err * valid_mask).sum() / (valid_mask.sum() * action_dim)`.
+    Ours expands the mask to element count instead of multiplying — the same divisor,
+    but a refactor could easily change one and not the other, so it is pinned here.
+
+    ACT's full objective adds `kl_weight * kld` on top, gated on `use_vae`. That term
+    regularises the CVAE's style latent, so it cannot be adopted separately from the
+    CVAE itself (Alternative Improvements, lever 2).
+    """
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+    for _ in range(5):
+        predicted, target = torch.randn(3, 8, 7), torch.randn(3, 8, 7)
+        is_pad = torch.rand(3, 8) < 0.4
+
+        abs_err = F.l1_loss(target, predicted, reduction="none")
+        valid_mask = ~is_pad.unsqueeze(-1)
+        num_valid = valid_mask.sum() * abs_err.shape[-1]
+        reference = (abs_err * valid_mask).sum() / num_valid.clamp_min(1)
+
+        torch.testing.assert_close(masked_l1_loss(predicted, target, is_pad), reference)

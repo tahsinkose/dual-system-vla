@@ -70,3 +70,17 @@ python scripts/smoke_test.py --only mujoco      # a single check
 ```
 
 It exits non-zero if any check fails, so it can gate a setup script or CI.
+
+## Handling Dataset vs. Benchmark ID mismatch
+
+Unit tests cover the dataset/simulator task mapping:
+
+```bash
+python -m pytest tests/ -q
+python -m src.utils          # print the dataset-index -> benchmark-id table
+```
+
+The dataset's `task_index` and the LIBERO benchmark's task id are two different
+orderings over the same tasks, sharing no fixed points — passing one where the other
+is expected silently evaluates a different task. `src/utils.py` holds the adapter that
+reconciles them, joining on the instruction string.

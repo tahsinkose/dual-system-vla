@@ -194,6 +194,52 @@ def build_model(cfg: TrainConfig) -> DualSystem:
     ))
 
 
+# ---------------------------------------------------------------------- metrics
+
+
+class MetricsLog:
+    """Append-only JSONL record of training progress.
+
+    One flushed line per logging interval, so a run that is killed still leaves usable
+    history — the ablation compares two checkpoints, and their loss curves are part of
+    the result, not just a debugging aid. JSONL rather than TensorBoard or W&B because
+    it needs no server or account, diffs cleanly, and can be replotted long afterwards.
+
+    Also records the *instantaneous* rate rather than the cumulative average, which is
+    what reveals a run slowing down (thermal throttling, a contended dataloader) — a
+    running average hides that behind its own history.
+    """
+
+    def __init__(self, path: Path, cfg: TrainConfig, counts: dict[str, int]) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Truncate: a fresh run should not append to a previous run's curve.
+        with self.path.open("w") as handle:
+            handle.write(json.dumps({
+                "type": "run",
+                "conditioning": cfg.conditioning,
+                "steps": cfg.steps,
+                "batch_size": cfg.batch_size,
+                "chunk_size": cfg.chunk_size,
+                "temporal_offset": cfg.temporal_offset,
+                "lr_system1": cfg.lr_system1,
+                "lr_system2": cfg.lr_system2,
+                "seed": cfg.seed,
+                "trainable_parameters": counts["trainable"],
+                "total_parameters": counts["total"],
+            }) + "\n")
+
+    def log(self, step: int, loss: float, rate: float, elapsed: float) -> None:
+        with self.path.open("a") as handle:
+            handle.write(json.dumps({
+                "type": "step",
+                "step": step,
+                "loss": round(loss, 6),
+                "it_per_s": round(rate, 3),
+                "elapsed_s": round(elapsed, 1),
+            }) + "\n")
+
+
 # ------------------------------------------------------------------------- loop
 
 
@@ -220,11 +266,15 @@ def train(cfg: TrainConfig) -> Path:
     print(f"conditioning : {cfg.conditioning}")
     print(f"episodes     : {dataset.num_episodes} | frames: {dataset.num_frames}")
     print(f"trainable    : {counts['trainable'] / 1e6:.2f}M of {counts['total'] / 1e6:.2f}M")
-    print(f"device       : {device}\n")
+    print(f"device       : {device}")
+    print(f"metrics      : {output_dir / 'metrics.jsonl'}\n")
+
+    metrics = MetricsLog(output_dir / "metrics.jsonl", cfg, counts)
 
     model.train()
     step, started = 0, time.time()
     running = 0.0
+    last_log_at = started
     while step < cfg.steps:
         for batch in loader:
             if step >= cfg.steps:
@@ -248,10 +298,15 @@ def train(cfg: TrainConfig) -> Path:
             step += 1
 
             if step % cfg.log_every == 0:
-                rate = step / (time.time() - started)
-                print(f"step {step:>7d} | loss {running / cfg.log_every:.4f} "
-                      f"| {rate:.2f} it/s")
+                now = time.time()
+                # Instantaneous rate over this interval, not the cumulative average:
+                # a run that slows down should be visible while it happens.
+                rate = cfg.log_every / max(now - last_log_at, 1e-9)
+                mean_loss = running / cfg.log_every
+                print(f"step {step:>7d} | loss {mean_loss:.4f} | {rate:.2f} it/s")
+                metrics.log(step, mean_loss, rate, now - started)
                 running = 0.0
+                last_log_at = now
             if step % cfg.checkpoint_every == 0:
                 save_checkpoint(model, cfg, step, output_dir)
 

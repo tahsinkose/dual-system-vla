@@ -139,3 +139,54 @@ A correct replay reaches task success with roughly 0.007 m mean tracking error. 
 episode whose initial state was never matched still runs, but starts from the
 environment's own reset and will almost certainly fail — the output says so
 explicitly.
+## Training
+
+Two checkpoints are trained, identical apart from how the latent `z` is produced.
+That is the point: any difference between them is attributable to the conditioning
+and nothing else.
+
+```bash
+# CKPT-DUAL — System 2 conditions System 1 with a live latent
+CUDA_VISIBLE_DEVICES=0 nohup python -m src.train \
+  --conditioning live \
+  --steps 100000 --batch-size 16 --num-workers 8 \
+  --output-dir outputs/train > outputs/dual.log 2>&1 &
+
+# CKPT-STATIC — the naive baseline: a static embedding of the instruction
+CUDA_VISIBLE_DEVICES=1 nohup python -m src.train \
+  --conditioning static \
+  --steps 100000 --batch-size 16 --num-workers 8 \
+  --output-dir outputs/train > outputs/static.log 2>&1 &
+```
+
+Checkpoints, the resolved config and the metrics log are written per run to
+`outputs/train/{live,static}/`.
+
+### Before a long run
+
+The first invocation downloads the ~7.5 GB System 2 backbone
+(`Qwen/Qwen2.5-VL-3B-Instruct`) into `data/huggingface/`. That is separate from the
+dataset and happens once. A short overfitting run gets it out of the way and confirms
+the model trains at all:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m src.train \
+  --conditioning live --overfit-episodes 5 --steps 300 --batch-size 8 \
+  --output-dir outputs/gate
+```
+
+Loss should fall steeply — five episodes are few enough that a working model overfits
+hard. If it plateaus, something upstream is wrong and a full run will not fix it.
+
+### Batch size
+
+`--batch-size 16` peaks at ~23.5 GB on a 24 GB card, which fits but leaves little
+headroom for fragmentation over a long run. 32 does not fit. If a run OOMs partway,
+this usually reclaims enough without changing the optimisation:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 python -m src.train ...
+```
+
+Every sample costs a full Qwen-3B forward *and* backward through the LoRA adapters, so
+memory scales with batch size far more steeply than the 71.7M System 1 alone suggests.

@@ -47,8 +47,8 @@ def resolve(path: Path) -> Path:
     return candidate
 
 
-def read_run(path: Path) -> tuple[dict, list[dict]]:
-    """Return the run header and its step records.
+def read_run(path: Path) -> tuple[dict, list[dict], list[dict]]:
+    """Return the run header, its step records, and its validation records.
 
     A run killed mid-write can leave a truncated final line; it is skipped rather than
     allowed to abort the plot, since partial curves are exactly what one wants to
@@ -56,6 +56,7 @@ def read_run(path: Path) -> tuple[dict, list[dict]]:
     """
     header: dict = {}
     steps: list[dict] = []
+    validations: list[dict] = []
     for line in path.read_text().splitlines():
         if not line.strip():
             continue
@@ -64,11 +65,16 @@ def read_run(path: Path) -> tuple[dict, list[dict]]:
         except json.JSONDecodeError:
             print(f"  skipping malformed final line in {path}", file=sys.stderr)
             continue
-        if record.get("type") == "step":
+        kind = record.get("type")
+        if kind == "step":
             steps.append(record)
+        elif kind == "validation":
+            validations.append(record)
         else:
+            # Only the run header lands here; folding validation records in would
+            # overwrite its fields one pass at a time.
             header.update(record)
-    return header, steps
+    return header, steps, validations
 
 
 def moving_average(values: list[float], window: int) -> list[float]:
@@ -100,19 +106,35 @@ def main() -> int:
     plotted = 0
     for run in args.runs:
         path = resolve(run)
-        header, steps = read_run(path)
+        header, steps, validations = read_run(path)
         if not steps:
             print(f"  {path} has no step records yet — skipping", file=sys.stderr)
             continue
+        label = label_for(path, header)
         xs = [s["step"] for s in steps]
         ys = moving_average([s[args.metric] for s in steps], args.smooth)
-        axis.plot(xs, ys, label=label_for(path, header), linewidth=1.6)
+        line, = axis.plot(xs, ys, label=f"{label} train", linewidth=1.6)
         plotted += 1
 
+        # Validation on the same axes and in the same colour, dashed. Overfitting is
+        # only visible as the *divergence* between the two, so plotting them apart —
+        # or on separate figures at different scales — hides the thing worth seeing.
+        if validations and args.metric == "loss":
+            axis.plot([v["step"] for v in validations],
+                      [v["val_loss"] for v in validations],
+                      linestyle="--", linewidth=1.4, color=line.get_color(),
+                      label=f"{label} val")
+            best = min(validations, key=lambda v: v["val_loss"])
+            axis.scatter([best["step"]], [best["val_loss"]], color=line.get_color(),
+                         zorder=5, s=36, marker="o")
+
         final = steps[-1]
-        print(f"{label_for(path, header):24s} steps={final['step']:>7d}  "
-              f"{args.metric}={final[args.metric]:.4f}  "
-              f"elapsed={final.get('elapsed_s', 0) / 60:.1f} min")
+        summary = (f"{label:20s} steps={final['step']:>7d}  "
+                   f"train={final[args.metric]:.4f}")
+        if validations:
+            best = min(validations, key=lambda v: v["val_loss"])
+            summary += f"  val={validations[-1]['val_loss']:.4f}  best={best['val_loss']:.4f} @ {best['step']}"
+        print(summary + f"  elapsed={final.get('elapsed_s', 0) / 60:.1f} min")
 
     if not plotted:
         raise SystemExit("nothing to plot")
@@ -122,8 +144,7 @@ def main() -> int:
     if args.log and args.metric == "loss":
         axis.set_yscale("log")
     axis.grid(alpha=0.3)
-    if plotted > 1:
-        axis.legend()
+    axis.legend()
     axis.set_title(f"{args.metric} — {plotted} run{'s' if plotted > 1 else ''}"
                    + (f", smoothed over {args.smooth}" if args.smooth > 1 else ""))
 

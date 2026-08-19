@@ -408,15 +408,15 @@ def train(cfg: TrainConfig) -> Path:
                 # a run that slows down should be visible while it happens.
                 rate = cfg.log_every / max(now - last_log_at, 1e-9)
                 mean_loss = running / cfg.log_every
-                print(f"step {step:>7d} | loss {mean_loss:.4f} | {rate:.2f} it/s")
+                print(f"step {step:>7d} | train {mean_loss:.4f} | {rate:.2f} it/s")
                 metrics.log(step, mean_loss, rate, now - started)
                 running = 0.0
                 last_log_at = now
             if val_loader is not None and step % cfg.val_every == 0:
                 val_loss = validate(model, val_loader, device)
                 improved = val_loss < best_val
-                marker = "  <- best" if improved else ""
-                print(f"step {step:>7d} | val {val_loss:.4f}{marker}")
+                marker = "  <- best" if improved else f"  (best {best_val:.4f})"
+                print(f"step {step:>7d} |   val {val_loss:.4f}{marker}")
                 metrics.log_validation(step, val_loss, is_best=improved)
                 if improved:
                     best_val = val_loss

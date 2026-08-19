@@ -237,6 +237,42 @@ def test_recovered_is_false_when_no_post_trigger_success():
     assert result.steps_to_recovery is None
 
 
+def test_after_success_trigger_fires_although_the_env_reports_done_at_success():
+    """LIBERO derives `done` from its goal predicate, so an episode would otherwise end
+    on the step it succeeds — leaving `first_success_step + N` unreachable for any N
+    above zero, and the recovery ablation unable to run at all."""
+    model = _tiny_model()
+    env = FakeLiberoEnv(horizon=100, success_at_steps=frozenset({2}))
+    cfg = _cfg(horizon=20)
+    spec = _spec(kind=PerturbationKind.UNDO_PROGRESS,
+                 trigger=TriggerCondition(after_success_steps=5))
+    result = _run(model, env, cfg, spec=spec)
+    assert result.first_success_step == 2
+    assert result.perturbation_applied is True
+    assert result.perturbation_trigger_step == 7      # 2 + 5
+
+
+def test_unperturbed_episode_runs_on_past_success_for_the_video():
+    """The goal predicate can hold before the outcome is visible — a placed object
+    counts as contained while the gripper still holds it — so a recording cut at the
+    trigger does not show the episode being solved."""
+    model = _tiny_model()
+    env = FakeLiberoEnv(horizon=100, success_at_steps=frozenset({3}))
+    cfg = _cfg(horizon=50, post_success_steps=4)
+    result = _run(model, env, cfg)
+    assert result.first_success_step == 3
+    assert result.steps_run == 8            # 3 + 1 + 4, not the full horizon
+
+
+def test_unperturbed_episode_stops_promptly_after_success():
+    """Running on is bounded: it must not silently become a full-horizon rollout."""
+    model = _tiny_model()
+    env = FakeLiberoEnv(horizon=100, success_at_steps=frozenset({1}))
+    cfg = _cfg(horizon=50, post_success_steps=0)
+    result = _run(model, env, cfg)
+    assert result.steps_run == 2            # 1 + 1 + 0
+
+
 def test_undo_progress_precondition_snapshot_is_taken_before_any_step():
     import eval.run_eval as run_eval_module
 

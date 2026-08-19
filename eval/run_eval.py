@@ -75,6 +75,8 @@ class EvalConfig:
     displacement_radius_m: float = DEFAULT_DISPLACEMENT_RADIUS_M
     horizon: int = 600
     settle_steps: int = 10
+    post_success_steps: int = 25             # steps to keep running after the goal is
+                                              # first satisfied; see run_episode
     camera_size: int = 256
     video_dir: Path | None = None
     log_path: Path = Path("outputs/eval/results.jsonl")
@@ -161,6 +163,25 @@ class TemporalOffsetBuffer:
         return self._frames[-1]
 
 
+def _episode_is_over(scheduler: PerturbationScheduler, perturbation: PerturbationSpec,
+                     steps_taken: int, post_success_steps: int) -> bool:
+    """Whether to stop before the horizon, given what the episode still has to observe.
+
+    The environment's own `done` is not consulted. LIBERO sets it from the goal
+    predicate, so it ends the episode at the instant of success — which truncates a
+    video before the gripper releases, and makes an `after_success_steps` perturbation
+    trigger unreachable for any offset above zero.
+
+    An unperturbed episode ends `post_success_steps` after the goal is first satisfied.
+    A perturbed one runs to the horizon: before the trigger because the trigger may
+    still be pending, and after it because recovery is the thing being measured.
+    """
+    if perturbation.kind is not PerturbationKind.NONE:
+        return False
+    first_success = scheduler.first_success_step
+    return first_success is not None and steps_taken >= first_success + 1 + post_success_steps
+
+
 def run_episode(
     model: DualSystem,
     env,
@@ -222,7 +243,7 @@ def run_episode(
                 steps_since_update_trace.append(model.steps_since_latent_update)
 
             action = np.clip(actions[0, 0].cpu().numpy(), -1.0, 1.0)
-            obs, _reward, done, _info = env.step(action)
+            obs, _reward, _done, _info = env.step(action)
 
             tracker.update(step_index)
             if env.check_success():
@@ -260,7 +281,7 @@ def run_episode(
                 video.add_frame(obs["agentview_image"], step_index, since_perturb)
 
             step_index += 1
-            if done:
+            if _episode_is_over(scheduler, perturbation, step_index, cfg.post_success_steps):
                 break
     finally:
         if video is not None:
@@ -382,6 +403,11 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
     p.add_argument("--displacement-radius-m", type=float, default=DEFAULT_DISPLACEMENT_RADIUS_M)
     p.add_argument("--horizon", type=int, default=600)
     p.add_argument("--settle-steps", type=int, default=10)
+    p.add_argument("--post-success-steps", type=int, default=25,
+                   help="keep stepping this many steps after the goal is first satisfied, "
+                        "so a video shows the outcome rather than cutting at the instant "
+                        "the predicate flips. Does not change the reported success step; "
+                        "ignored when a perturbation is configured, which runs to the horizon")
     p.add_argument("--camera-size", type=int, default=256)
     p.add_argument("--video-dir", type=Path, default=None)
     p.add_argument("--log-path", type=Path, default=Path("outputs/eval/results.jsonl"))

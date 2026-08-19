@@ -15,7 +15,19 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from eval.logging import EpisodeResult, JsonlResultWriter, summarize, write_latent_trace  # noqa: E402
+from eval.logging import (  # noqa: E402
+    EpisodeResult,
+    JsonlResultWriter,
+    subtask_breakdown,
+    summarize,
+    write_latent_trace,
+)
+
+
+def _subtask(id, description, first_achieved_step=None, achieved_at_reset=False,
+             achieved_at_end=False) -> dict:
+    return dict(id=id, description=description, achieved_at_reset=achieved_at_reset,
+                first_achieved_step=first_achieved_step, achieved_at_end=achieved_at_end)
 
 
 def _result(**overrides) -> EpisodeResult:
@@ -109,3 +121,55 @@ def test_summarize_uses_steps_run_when_never_succeeded():
     summary = summarize(results)
     assert "0/1 succeeded (0.0%)" in summary
     assert "mean 99.0" in summary
+
+
+# ------------------------------------------------------------- subtask breakdown
+
+
+def _two_step_result(placed: bool, **overrides) -> EpisodeResult:
+    return _result(
+        success=placed, steps_to_success=10 if placed else None,
+        subtasks=[
+            _subtask("grasp:soup_1", "pick up the soup", first_achieved_step=3),
+            _subtask("in:soup_1:basket", "place the soup in the basket",
+                     first_achieved_step=8 if placed else None, achieved_at_end=placed),
+        ],
+        subtasks_achieved=2 if placed else 1, subtasks_total=2, **overrides)
+
+
+def test_breakdown_is_empty_without_subtask_records():
+    assert subtask_breakdown([_result()]) == ""
+    assert "subtask completion" not in summarize([_result()])
+
+
+def test_breakdown_counts_episodes_reaching_each_step():
+    """Where the count drops is the subtask the policy stalls at."""
+    results = [_two_step_result(placed=i < 1, episode_index=i) for i in range(4)]
+    breakdown = subtask_breakdown(results)
+    assert "pick up the soup" in breakdown
+    assert "  4/4  " in breakdown          # every episode grasped it
+    assert "  1/4  " in breakdown          # only one went on to place it
+
+
+def test_breakdown_groups_by_task():
+    results = [
+        _two_step_result(placed=True, task_dataset_index=0, task_instruction="first task"),
+        _two_step_result(placed=False, task_dataset_index=5, task_instruction="second task"),
+    ]
+    breakdown = subtask_breakdown(results)
+    assert "task 00  first task" in breakdown
+    assert "task 05  second task" in breakdown
+
+
+def test_breakdown_marks_conditions_already_true_at_reset():
+    """The stove in KITCHEN_SCENE8 is on before the policy acts; a bare 10/10 there
+    would read as progress the policy did not make."""
+    result = _result(subtasks=[
+        _subtask("turnon:stove_1", "keep the stove on", first_achieved_step=0,
+                 achieved_at_reset=True, achieved_at_end=True),
+    ], subtasks_achieved=1, subtasks_total=1)
+    assert "(satisfied at reset)" in subtask_breakdown([result])
+
+
+def test_summarize_includes_the_breakdown():
+    assert "subtask completion" in summarize([_two_step_result(placed=True)])

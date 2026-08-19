@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +47,14 @@ class EpisodeResult:
                                          # after perturbation_trigger_step
     steps_to_recovery: int | None       # steps from trigger to first post-trigger
                                          # success, if recovered
+
+    # Subtask progress — the resolution `success` alone cannot give on a long-horizon
+    # task. One `eval.subtasks.SubtaskRecord` per step of the decomposition, in order.
+    subtasks: list[dict] = field(default_factory=list)
+    # Both counts exclude subtasks already satisfied at reset, so they read as progress
+    # made out of progress available. The full decomposition is still in `subtasks`.
+    subtasks_achieved: int = 0
+    subtasks_total: int = 0
 
     # artifacts
     video_path: str | None = None
@@ -105,4 +113,39 @@ def summarize(results: list[EpisodeResult]) -> str:
         recovered = sum(bool(r.recovered) for r in perturbed)
         lines.append(f"recovery: {recovered}/{len(perturbed)} perturbed episodes recovered "
                      f"({recovered / len(perturbed):.1%})")
+    breakdown = subtask_breakdown(results)
+    if breakdown:
+        lines.append("")
+        lines.append(breakdown)
+    return "\n".join(lines)
+
+
+def subtask_breakdown(results: list[EpisodeResult]) -> str:
+    """Per-task, per-subtask completion counts over a run.
+
+    The column that matters is where the count falls off: a task whose first pick
+    completes 10/10 and whose second pick completes 0/10 is stalling at the subtask
+    transition, which a single success rate reports only as a uniform zero.
+
+    Subtasks already satisfied at reset are counted separately — crediting them to the
+    policy would make a task look partly solved before it acted.
+    """
+    per_task: dict[tuple[int, str], list[EpisodeResult]] = {}
+    for result in results:
+        if result.subtasks:
+            key = (result.task_dataset_index, result.task_instruction)
+            per_task.setdefault(key, []).append(result)
+    if not per_task:
+        return ""
+
+    lines = ["subtask completion (episodes achieving each step, in task order):"]
+    for (task_index, instruction), group in sorted(per_task.items()):
+        lines.append(f"  task {task_index:02d}  {instruction}")
+        width = max(len(s["description"]) for r in group for s in r.subtasks)
+        for position in range(max(len(r.subtasks) for r in group)):
+            steps = [r.subtasks[position] for r in group if position < len(r.subtasks)]
+            achieved = sum(s["first_achieved_step"] is not None for s in steps)
+            note = "  (satisfied at reset)" if all(s["achieved_at_reset"] for s in steps) else ""
+            lines.append(f"    {steps[0]['description']:<{width}}  "
+                         f"{achieved:>3d}/{len(steps):<3d}{note}")
     return "\n".join(lines)

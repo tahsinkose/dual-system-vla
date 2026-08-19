@@ -34,6 +34,11 @@ from eval.run_eval import EvalConfig, TemporalOffsetBuffer, resolve_episodes, ru
 from _fake_env import FakeLiberoEnv  # noqa: E402
 
 INSTRUCTION = "put both the alphabet soup and the tomato sauce in the basket"
+# A real libero_10 task: the rollout loop looks its subtask decomposition up by BDDL
+# basename, so a placeholder name would not resolve.
+BDDL = "LIVING_ROOM_SCENE2_put_both_the_alphabet_soup_and_the_tomato_sauce_in_the_basket.bddl"
+GRASP_SOUP = "grasp:alphabet_soup_1"
+PLACE_SOUP = "in:alphabet_soup_1:basket_1_contain_region"
 
 
 @pytest.fixture(autouse=True)
@@ -67,6 +72,13 @@ class _SpyEnv(FakeLiberoEnv):
     def step(self, action):
         self.step_actions.append(np.array(action, dtype=np.float64, copy=True))
         return super().step(action)
+
+
+def _trial(index=0, init_state=None):
+    from eval.trials import Trial
+
+    return Trial(task_dataset_index=0, instruction=INSTRUCTION, bddl=BDDL,
+                 init_state=init_state, source=InitSource.BENCHMARK, index=index)
 
 
 def _run(model, env, cfg, spec=None, conditioning=None):
@@ -253,7 +265,70 @@ def test_undo_progress_precondition_snapshot_is_taken_before_any_step():
     assert call_order[0] == "snapshot"   # taken before the first model.act() call
 
 
-# --------------------------------------------------------------------- resolve_episodes
+# ---------------------------------------------------------------- subtask logging
+
+
+def test_subtask_progress_is_recorded_per_episode():
+    """A rollout that grasps the soup and places it, then never touches the sauce.
+
+    Its `success` is False — the goal is a conjunction — so only the per-subtask
+    record distinguishes it from a rollout that never moved.
+    """
+    model = _tiny_model()
+    env = FakeLiberoEnv(horizon=100, subtask_true_at={
+        GRASP_SOUP: frozenset({1, 2, 3}),      # released on placement, as a real grasp is
+        PLACE_SOUP: frozenset({4, 5, 6, 7}),
+    })
+    result = _run(model, env, _cfg(horizon=8))
+
+    assert result.subtasks_total == 4
+    assert result.subtasks_achieved == 2
+    records = {s["id"]: s for s in result.subtasks}
+    assert records[GRASP_SOUP]["first_achieved_step"] == 1
+    assert records[GRASP_SOUP]["achieved_at_end"] is False
+    assert records[PLACE_SOUP]["first_achieved_step"] == 4
+    assert records[PLACE_SOUP]["achieved_at_end"] is True
+    assert records["grasp:tomato_sauce_1"]["first_achieved_step"] is None
+    assert result.success is False
+
+
+def test_subtask_records_keep_task_order():
+    model = _tiny_model()
+    env = FakeLiberoEnv(horizon=100)
+    result = _run(model, env, _cfg(horizon=3))
+    assert [s["id"] for s in result.subtasks] == [
+        GRASP_SOUP, PLACE_SOUP, "grasp:tomato_sauce_1", "in:tomato_sauce_1:basket_1_contain_region",
+    ]
+
+
+def test_subtask_state_at_reset_is_read_before_the_first_action():
+    model = _tiny_model()
+    env = FakeLiberoEnv(horizon=100, subtask_true_at={PLACE_SOUP: frozenset({-1, 0, 1})})
+    result = _run(model, env, _cfg(horizon=3))
+    records = {s["id"]: s for s in result.subtasks}
+    assert records[PLACE_SOUP]["achieved_at_reset"] is True
+    assert records[GRASP_SOUP]["achieved_at_reset"] is False
+
+
+def test_perturbation_undoing_a_subtask_shows_in_the_final_reading():
+    """`achieved_at_end` is re-read at the moment the perturbation edits sim state."""
+    model = _tiny_model()
+    env = FakeLiberoEnv(horizon=100, subtask_true_at={PLACE_SOUP: frozenset({0, 1, 2})})
+    spec = _spec(kind=PerturbationKind.DISPLACE_OBJECT, trigger=TriggerCondition(at_step=3))
+    result = _run(model, env, _cfg(horizon=6), spec=spec)
+    records = {s["id"]: s for s in result.subtasks}
+    assert records[PLACE_SOUP]["first_achieved_step"] == 0
+    assert records[PLACE_SOUP]["achieved_at_end"] is False
+
+
+# ------------------------------------------------------------------- trial building
+
+
+class _FakeTask:
+    dataset_index = 0
+    instruction = INSTRUCTION
+    bddl = BDDL
+    suite = "libero_10"
 
 
 class _FakeMapping:
@@ -355,6 +430,9 @@ def test_end_to_end_tiny_model_rollout_on_real_env(tmp_path):
     assert len(lines) == 1
     parsed = json.loads(lines[0])
     assert parsed["task_dataset_index"] == 0
+    # The subtask decomposition survives the round trip through the real env and JSONL.
+    assert 0 < parsed["subtasks_total"] <= len(parsed["subtasks"])
+    assert all("first_achieved_step" in s for s in parsed["subtasks"])
 
     videos = list((tmp_path / "videos").glob("*.mp4"))
     assert len(videos) == 1

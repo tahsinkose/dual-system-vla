@@ -49,8 +49,23 @@ class _FakeSim:
 
 
 class _FakeMujocoObject:
-    def __init__(self, joints: list[str]) -> None:
+    def __init__(self, joints: list[str], name: str = "") -> None:
         self.joints = joints
+        self.name = name
+
+
+class _ObjectsDict(dict):
+    """`env.env.objects_dict`, minting an entry for any name asked for.
+
+    Which objects a task actually defines is checked against the real BDDL files in
+    tests/test_subtasks.py; this double only has to resolve a name to something
+    `_check_grasp` can take.
+    """
+
+    def __missing__(self, name: str) -> _FakeMujocoObject:
+        obj = _FakeMujocoObject([f"{name}_joint0"], name=name)
+        self[name] = obj
+        return obj
 
 
 class _FakeGripper:
@@ -66,8 +81,19 @@ class _FakeRobot:
 class _FakeRobosuiteEnv:
     """Stands in for `env.env` (LIBERO's `BDDLBaseDomain` instance)."""
 
-    def __init__(self, objects_dict: dict[str, _FakeMujocoObject]) -> None:
+    def __init__(self, parent: "FakeLiberoEnv", objects_dict: _ObjectsDict) -> None:
+        self._parent = parent
         self.objects_dict = objects_dict
+
+    @property
+    def robots(self):
+        return self._parent.robots
+
+    def _check_grasp(self, gripper, object_geoms) -> bool:
+        return self._parent.subtask_is_true(f"grasp:{object_geoms.name}")
+
+    def _eval_predicate(self, literal) -> bool:
+        return self._parent.subtask_is_true(":".join(literal))
 
 
 @dataclass
@@ -87,6 +113,9 @@ class FakeLiberoEnv:
     gripper_joint_names: tuple[str, str] = ("gripper0_finger_joint1", "gripper0_finger_joint2")
     success_at_steps: frozenset[int] = field(default_factory=frozenset)
     horizon: int = 10_000
+    # `eval.subtasks.Subtask.id` -> the step indices at which it reads True. Step -1 is
+    # the post-reset reading `SubtaskTracker` takes before the first action.
+    subtask_true_at: dict[str, frozenset[int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         initial_qpos = {
@@ -99,11 +128,13 @@ class FakeLiberoEnv:
         }
         self._data = _FakeData(initial_qpos)
         self.sim = _FakeSim(self._data)
-        self.env = _FakeRobosuiteEnv({
-            name: _FakeMujocoObject([f"{name}_joint0"]) for name in self.obj_of_interest
-        })
-        self.env.objects_dict[self.obj_of_interest[0]] = _FakeMujocoObject([self.joint_name])
         self.robots = [_FakeRobot(list(self.gripper_joint_names))]
+        objects = _ObjectsDict({
+            name: _FakeMujocoObject([f"{name}_joint0"], name=name) for name in self.obj_of_interest
+        })
+        objects[self.obj_of_interest[0]] = _FakeMujocoObject([self.joint_name],
+                                                             name=self.obj_of_interest[0])
+        self.env = _FakeRobosuiteEnv(self, objects)
 
         self._step_count = 0
         self.set_init_state_calls = 0
@@ -141,6 +172,10 @@ class FakeLiberoEnv:
 
     def check_success(self) -> bool:
         return self._step_count > 0 and (self._step_count - 1) in self.success_at_steps
+
+    def subtask_is_true(self, subtask_id: str) -> bool:
+        """Whether a scripted subtask reads True at the current step."""
+        return (self._step_count - 1) in self.subtask_true_at.get(subtask_id, frozenset())
 
     def close(self) -> None:
         self.closed = True

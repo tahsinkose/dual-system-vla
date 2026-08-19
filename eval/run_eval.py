@@ -53,6 +53,7 @@ from eval.perturbations import (  # noqa: E402
     apply_perturbation,
     snapshot_target_object_pose,
 )
+from eval.subtasks import SubtaskTracker, subtasks_for  # noqa: E402
 from eval.trials import DEFAULT_TRIALS_PER_TASK, InitSource, Trial, build_trials  # noqa: E402
 from eval.video import RolloutVideoWriter  # noqa: E402
 
@@ -181,6 +182,9 @@ def run_episode(
     """
     model.reset()
     obs = reset_episode(env, trial.init_state, cfg.settle_steps)
+    # Built after settling, so `achieved_at_reset` describes the configuration the
+    # policy actually starts from.
+    tracker = SubtaskTracker(subtasks_for(trial.bddl), env)
     snapshot = snapshot_target_object_pose(env)   # baseline for UNDO_PROGRESS
     scheduler = PerturbationScheduler(perturbation)
     rng = perturbation.make_rng()
@@ -220,6 +224,7 @@ def run_episode(
             action = np.clip(actions[0, 0].cpu().numpy(), -1.0, 1.0)
             obs, _reward, done, _info = env.step(action)
 
+            tracker.update(step_index)
             if env.check_success():
                 success = True
                 if (trigger_step is not None and step_index > trigger_step
@@ -237,6 +242,10 @@ def run_episode(
                     # "would S2 notice right now", not part of the control path.
                     z_pre = model.compute_latent([buffer.latest_frame()], [trial.instruction], probe_source)
                 obs = apply_perturbation(env, perturbation.kind, rng, snapshot, perturbation.displacement_radius_m)
+                # A perturbation edits simulator state directly; re-reading here is
+                # what makes an undone subtask visible as such rather than as an
+                # unexplained drop in the next step's reading.
+                tracker.update(step_index)
                 if env.check_success():
                     success = True
                 if eval_conditioning is not Conditioning.ZERO:
@@ -279,6 +288,8 @@ def run_episode(
         perturbation_trigger_step=trigger_step, perturbation_applied=scheduler.fired,
         first_success_step=scheduler.first_success_step,
         latent_cosine_distance=cosine_distance, recovered=recovered, steps_to_recovery=steps_to_recovery,
+        subtasks=tracker.as_dicts(), subtasks_achieved=tracker.n_achieved,
+        subtasks_total=tracker.n_total,
         video_path=str(video.path) if video is not None else None,
         latent_trace_path=str(latent_trace_path) if latent_trace_path else None,
     )
@@ -330,8 +341,13 @@ def main(cfg: EvalConfig) -> list[EpisodeResult]:
                 env.close()
             writer.write(result)
             results.append(result)
+            reached = next((s["description"] for s in reversed(result.subtasks)
+                            if s["first_achieved_step"] is not None
+                            and not s["achieved_at_reset"]), "nothing")
             print(f"{trial.name} (task {trial.task_dataset_index}): "
-                  f"{'SUCCESS' if result.success else 'failure'} in {result.steps_run} steps")
+                  f"{'SUCCESS' if result.success else 'failure'} in {result.steps_run} steps, "
+                  f"{result.subtasks_achieved}/{result.subtasks_total} subtasks "
+                  f"(furthest: {reached})")
     finally:
         writer.close()
 

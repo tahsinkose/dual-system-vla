@@ -88,7 +88,7 @@ Files land in `data/lerobot/` inside the repo rather than `~/.cache`, because
 `lerobot` is imported, which is why every entry point calls `setup_env()` before
 importing it — fetching the dataset any other way puts it in your home cache instead.
 
-## Handling Dataset vs. Benchmark ID mismatch
+### Handling Dataset vs. Benchmark ID mismatch
 
 Unit tests cover the dataset/simulator task mapping:
 
@@ -102,7 +102,7 @@ orderings over the same tasks, sharing no fixed points — passing one where the
 is expected silently evaluates a different task. `src/utils.py` holds the adapter that
 reconciles them, joining on the instruction string.
 
-## Initial simulator states
+### Initial simulator states
 
 The LeRobot dataset drops the MuJoCo state each demonstration started from; LIBERO's
 original HDF5 demos keep it (`states[0]`), and `scripts/extract_init_states.py`
@@ -190,3 +190,29 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 python -
 
 Every sample costs a full Qwen-3B forward *and* backward through the LoRA adapters, so
 memory scales with batch size far more steeply than the 71.7M System 1 alone suggests.
+
+## Evaluation
+
+
+```bash
+# headline number: CKPT-DUAL as trained, all ten tasks
+python -m eval.run_eval --checkpoint outputs/train/live/best.pt \
+  --log-path outputs/eval/dual-live.jsonl
+
+# same checkpoint, different modality
+python -m eval.run_eval --checkpoint outputs/train/live/best.pt --conditioning zero \
+  --log-path outputs/eval/dual-zero.jsonl
+```
+
+Defaults follow LIBERO's published protocol: 10 trials per task from the benchmark's
+own `.pruned_init` states. `--init-source demo` starts from a demonstration's recovered
+state instead — training has seen those, so it is for debugging only, never a reported
+number. Pass `best.pt` explicitly: a bare run directory resolves to the *latest*
+`step_*.pt`, not the best-validation one.
+
+| Modality | Checkpoint | `--conditioning` |
+|---|---|---|
+| Full dual-system | `train/live` | *(omit — as trained)* |
+| Frozen-S2 | `train/live` | `frozen` |
+| Naive baseline | `train/static` | *(omit — as trained)* |
+| Zero-latent | `train/live` | `zero` |

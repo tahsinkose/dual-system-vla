@@ -69,12 +69,11 @@ MATCH_TOLERANCE = 1e-3
 def read_demos(remote_path: str, cache_path: Path) -> dict[str, tuple]:
     """Fetch (actions, initial state) for every demo, without keeping the images.
 
-    Downloads the whole ~1.4 GB HDF5 in one streaming pass rather than doing a
-    per-dataset HTTPS range request per demo: HDF5's chunked layout turns "just fetch
-    the few MB we need" into many small round trips, and round-trip latency — not
-    bandwidth — is what actually dominates over a real network. The raw download is
-    discarded once the two datasets we need are pulled into ``cache_path``, which is
-    what every later call (or a re-extract of this task) actually re-reads.
+    Downloads the whole ~1.4 GB HDF5 in one streaming pass rather than issuing an
+    HTTPS range request per demo: HDF5's chunked layout turns a small logical read into
+    many small round trips, and round-trip latency rather than bandwidth dominates over
+    a real network. The raw download is discarded once ``actions`` and ``states[0]``
+    are extracted into ``cache_path``, which every later call re-reads instead.
     """
     import numpy as np
 

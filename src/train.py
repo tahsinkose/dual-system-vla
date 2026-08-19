@@ -68,6 +68,9 @@ class TrainConfig:
 
     log_every: int = 100
     checkpoint_every: int = 5_000
+    val_fraction: float = 0.1     # per task; 0 disables validation entirely
+    val_every: int = 1_000        # steps between validation passes
+    val_batches: int = 25         # batches per pass, bounding its cost
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Restrict to these dataset task indices; None means all ten.
@@ -93,24 +96,68 @@ def build_delta_timestamps(cfg: TrainConfig, fps: float) -> dict[str, list[float
     }
 
 
-def build_dataset(cfg: TrainConfig):
+def split_episodes(episodes: list[int], val_fraction: float) -> tuple[list[int], list[int]]:
+    """Deterministic train/validation split of one task's episodes.
+
+    Takes every k-th episode for validation rather than sampling randomly. Determinism
+    matters more than randomness here: CKPT-DUAL and CKPT-STATIC must validate on the
+    identical set for their curves to be comparable, and a stride needs no shared seed
+    to guarantee that. Spreading the picks across the task also avoids correlating the
+    split with whatever ordering the conversion happened to produce.
+    """
+    if val_fraction <= 0 or len(episodes) < 2:
+        return list(episodes), []
+    stride = max(2, round(1 / val_fraction))
+    val = [e for i, e in enumerate(episodes) if i % stride == 0]
+    # Never hand back an empty training set for a task with very few episodes.
+    if len(val) >= len(episodes):
+        val = val[:1]
+    train = [e for e in episodes if e not in set(val)]
+    return train, val
+
+
+def build_datasets(cfg: TrainConfig):
+    """Return ``(train_dataset, val_dataset_or_None)``.
+
+    The validation set exists only to choose a checkpoint and to reveal overfitting.
+    It is *not* the success metric: that is measured by rolling out in the simulator
+    from LIBERO's own initial states (see eval/trials.py), which no demonstration
+    starts from.
+    """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
     from src.utils import episodes_for_task
 
     fps = LeRobotDatasetMetadata(REPO_ID).fps
-    dataset = LeRobotDataset(REPO_ID, delta_timestamps=build_delta_timestamps(cfg, fps))
+    deltas = build_delta_timestamps(cfg, fps)
+    full = LeRobotDataset(REPO_ID, delta_timestamps=deltas)
 
-    episodes = None
-    if cfg.task_indices is not None:
-        episodes = sorted(e for t in cfg.task_indices for e in episodes_for_task(dataset, t))
+    task_indices = cfg.task_indices if cfg.task_indices is not None else None
+    if task_indices is None:
+        from src.utils import TaskMapping
+
+        task_indices = TaskMapping.from_dataset(full).dataset_indices()
+
+    # Split per task, so validation covers every task rather than whichever ones
+    # happen to fall at the end of a global ordering.
+    train_episodes: list[int] = []
+    val_episodes: list[int] = []
+    for task_index in sorted(task_indices):
+        task_train, task_val = split_episodes(episodes_for_task(full, task_index),
+                                              cfg.val_fraction)
+        train_episodes += task_train
+        val_episodes += task_val
+
     if cfg.overfit_episodes is not None:
-        episodes = (episodes or list(range(dataset.num_episodes)))[: cfg.overfit_episodes]
+        # Smoke-test mode deliberately has no validation: the point is to memorise a
+        # handful of episodes, so a held-out loss would be meaningless.
+        train_episodes = sorted(train_episodes + val_episodes)[: cfg.overfit_episodes]
+        val_episodes = []
 
-    if episodes is not None:
-        dataset = LeRobotDataset(REPO_ID, episodes=episodes,
-                                 delta_timestamps=build_delta_timestamps(cfg, fps))
-    return dataset
+    train_dataset = LeRobotDataset(REPO_ID, episodes=sorted(train_episodes), delta_timestamps=deltas)
+    val_dataset = (LeRobotDataset(REPO_ID, episodes=sorted(val_episodes), delta_timestamps=deltas)
+                   if val_episodes else None)
+    return train_dataset, val_dataset
 
 
 def split_batch(batch: dict) -> tuple[ModelObservation, list, torch.Tensor, torch.Tensor, list[str]]:
@@ -229,6 +276,15 @@ class MetricsLog:
                 "total_parameters": counts["total"],
             }) + "\n")
 
+    def log_validation(self, step: int, val_loss: float, is_best: bool) -> None:
+        with self.path.open("a") as handle:
+            handle.write(json.dumps({
+                "type": "validation",
+                "step": step,
+                "val_loss": round(val_loss, 6),
+                "is_best": is_best,
+            }) + "\n")
+
     def log(self, step: int, loss: float, rate: float, elapsed: float) -> None:
         with self.path.open("a") as handle:
             handle.write(json.dumps({
@@ -240,6 +296,34 @@ class MetricsLog:
             }) + "\n")
 
 
+@torch.no_grad()
+def validate(model: DualSystem, loader, device: torch.device, max_batches: int) -> float:
+    """Mean masked L1 over held-out episodes.
+
+    Switches to eval mode and restores training mode afterwards — forgetting the
+    restore is a classic silent bug, since training would continue with dropout
+    disabled and the loss curve would look *better*, not worse.
+    """
+    was_training = model.training
+    model.eval()
+    total, batches = 0.0, 0
+    try:
+        for batch in loader:
+            if batches >= max_batches:
+                break
+            observation, system2_frames, actions, is_pad, instructions = split_batch(batch)
+            observation = observation.to(device)
+            actions, is_pad = actions.to(device), is_pad.to(device)
+            system2_frames = [frame.to(device) for frame in system2_frames]
+            predicted, _latent = model(observation.images, observation.state,
+                                       system2_frames, instructions)
+            total += masked_l1_loss(predicted, actions, is_pad).item()
+            batches += 1
+    finally:
+        model.train(was_training)
+    return total / max(batches, 1)
+
+
 # ------------------------------------------------------------------------- loop
 
 
@@ -247,11 +331,20 @@ def train(cfg: TrainConfig) -> Path:
     torch.manual_seed(cfg.seed)
     device = torch.device(cfg.device)
 
-    dataset = build_dataset(cfg)
+    dataset, val_dataset = build_datasets(cfg)
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=cfg.batch_size, shuffle=True,
         num_workers=cfg.num_workers, pin_memory=device.type == "cuda", drop_last=True,
     )
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = torch.utils.data.DataLoader(
+            # Not shuffled: the same batches every pass, so successive validation
+            # losses differ because the model changed, not because the sample did.
+            val_dataset, batch_size=cfg.batch_size, shuffle=False,
+            num_workers=max(1, cfg.num_workers // 2),
+            pin_memory=device.type == "cuda", drop_last=False,
+        )
 
     model = build_model(cfg).to(device)
     optimizer = build_optimizer(model, cfg)
@@ -264,7 +357,8 @@ def train(cfg: TrainConfig) -> Path:
     )
 
     print(f"conditioning : {cfg.conditioning}")
-    print(f"episodes     : {dataset.num_episodes} | frames: {dataset.num_frames}")
+    held_out = val_dataset.num_episodes if val_dataset is not None else 0
+    print(f"episodes     : {dataset.num_episodes} train | {held_out} validation")
     print(f"trainable    : {counts['trainable'] / 1e6:.2f}M of {counts['total'] / 1e6:.2f}M")
     print(f"device       : {device}")
     print(f"metrics      : {output_dir / 'metrics.jsonl'}\n")
@@ -275,6 +369,7 @@ def train(cfg: TrainConfig) -> Path:
     step, started = 0, time.time()
     running = 0.0
     last_log_at = started
+    best_val = float("inf")
     while step < cfg.steps:
         for batch in loader:
             if step >= cfg.steps:
@@ -307,6 +402,18 @@ def train(cfg: TrainConfig) -> Path:
                 metrics.log(step, mean_loss, rate, now - started)
                 running = 0.0
                 last_log_at = now
+            if val_loader is not None and step % cfg.val_every == 0:
+                val_loss = validate(model, val_loader, device, cfg.val_batches)
+                improved = val_loss < best_val
+                marker = "  <- best" if improved else ""
+                print(f"step {step:>7d} | val {val_loss:.4f}{marker}")
+                metrics.log_validation(step, val_loss, is_best=improved)
+                if improved:
+                    best_val = val_loss
+                    # Written to a stable filename so evaluation never has to guess
+                    # which step generalised best from a directory of checkpoints.
+                    save_checkpoint(model, cfg, step, output_dir,
+                                    filename="best.pt", val_loss=val_loss)
             if step % cfg.checkpoint_every == 0:
                 save_checkpoint(model, cfg, step, output_dir)
 
@@ -315,10 +422,14 @@ def train(cfg: TrainConfig) -> Path:
     return final
 
 
-def save_checkpoint(model: DualSystem, cfg: TrainConfig, step: int, output_dir: Path) -> Path:
-    path = output_dir / f"step_{step:07d}.pt"
-    torch.save({"step": step, "conditioning": cfg.conditioning,
-                "state_dict": model.state_dict()}, path)
+def save_checkpoint(model: DualSystem, cfg: TrainConfig, step: int, output_dir: Path,
+                    filename: str | None = None, val_loss: float | None = None) -> Path:
+    path = output_dir / (filename or f"step_{step:07d}.pt")
+    payload = {"step": step, "conditioning": cfg.conditioning,
+               "state_dict": model.state_dict()}
+    if val_loss is not None:
+        payload["val_loss"] = val_loss
+    torch.save(payload, path)
     return path
 
 
@@ -346,6 +457,13 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
                    help="overfit this many episodes — the §1 training smoke-test gate")
     p.add_argument("--tiny", action="store_true",
                    help="small random models, for exercising the loop itself")
+    p.add_argument("--val-fraction", type=float, default=0.1,
+                   help="fraction of each task's episodes held out for validation "
+                        "(default: 0.1; 0 disables). Used only to pick a checkpoint and "
+                        "reveal overfitting — the success metric comes from simulator "
+                        "rollouts against LIBERO's own initial states")
+    p.add_argument("--val-every", type=int, default=1000, help="steps between validation passes")
+    p.add_argument("--val-batches", type=int, default=25, help="batches per validation pass")
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--checkpoint-every", type=int, default=5_000)
     args = p.parse_args(argv)

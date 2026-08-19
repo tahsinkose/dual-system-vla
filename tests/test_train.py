@@ -208,3 +208,93 @@ def test_loss_matches_acts_formulation():
         reference = (abs_err * valid_mask).sum() / num_valid.clamp_min(1)
 
         torch.testing.assert_close(masked_l1_loss(predicted, target, is_pad), reference)
+
+
+# ------------------------------------------------------------ validation split
+
+
+def test_split_is_disjoint_and_covers_everything():
+    from src.train import split_episodes
+
+    episodes = list(range(37))
+    train, val = split_episodes(episodes, 0.1)
+    assert set(train) & set(val) == set(), "an episode is in both splits"
+    assert sorted(train + val) == episodes, "episodes were lost or duplicated"
+    assert val, "no validation episodes held out"
+
+
+def test_split_is_deterministic_across_runs():
+    """CKPT-DUAL and CKPT-STATIC must validate on the identical set.
+
+    A stride rather than a seeded shuffle, so the two runs agree without having to
+    share an RNG seed — otherwise their validation curves would not be comparable.
+    """
+    from src.train import split_episodes
+
+    episodes = list(range(29))
+    assert split_episodes(episodes, 0.1) == split_episodes(episodes, 0.1)
+
+
+def test_split_never_empties_the_training_set():
+    """Tasks have as few as 29 episodes; a degenerate split must not starve training."""
+    from src.train import split_episodes
+
+    for count in (2, 3, 5, 29, 49):
+        train, val = split_episodes(list(range(count)), 0.1)
+        assert train, f"empty training set for {count} episodes"
+    # At realistic sizes — the smallest libero_10 task has 29 episodes — training must
+    # dominate. Below that the split degenerates gracefully rather than usefully.
+    for count in (29, 49):
+        train, val = split_episodes(list(range(count)), 0.1)
+        assert len(train) > 4 * len(val), f"validation too large at {count} episodes"
+
+
+def test_zero_fraction_disables_validation():
+    from src.train import split_episodes
+
+    train, val = split_episodes(list(range(20)), 0.0)
+    assert val == [] and train == list(range(20))
+
+
+def test_validation_restores_training_mode():
+    """Forgetting the restore would silently continue training with dropout disabled.
+
+    The loss curve would then look *better*, not worse, which is why this is asserted
+    rather than left to review.
+    """
+    from src.train import validate
+
+    cfg = TrainConfig(tiny=True, chunk_size=4)
+    model = build_model(cfg)
+    model.train()
+
+    batch = {
+        DATASET_MAIN_CAMERA: torch.rand(1, 2, 3, 32, 32),
+        DATASET_WRIST_CAMERA: torch.rand(1, 3, 32, 32),
+        "observation.state": torch.zeros(1, 8),
+        "action": torch.zeros(1, 4, 7),
+        "action_is_pad": torch.zeros(1, 4, dtype=torch.bool),
+        "task": ["do the thing"],
+    }
+    loss = validate(model, [batch], torch.device("cpu"), max_batches=1)
+    assert loss >= 0.0
+    assert model.training, "validate() left the model in eval mode"
+
+
+def test_validation_runs_without_gradients():
+    """A validation pass must not build a graph — it would leak memory across a run."""
+    from src.train import validate
+
+    cfg = TrainConfig(tiny=True, chunk_size=4)
+    model = build_model(cfg)
+    batch = {
+        DATASET_MAIN_CAMERA: torch.rand(1, 2, 3, 32, 32),
+        DATASET_WRIST_CAMERA: torch.rand(1, 3, 32, 32),
+        "observation.state": torch.zeros(1, 8),
+        "action": torch.zeros(1, 4, 7),
+        "action_is_pad": torch.zeros(1, 4, dtype=torch.bool),
+        "task": ["do the thing"],
+    }
+    model.zero_grad(set_to_none=True)
+    validate(model, [batch], torch.device("cpu"), max_batches=1)
+    assert all(p.grad is None for p in model.parameters() if p.requires_grad)

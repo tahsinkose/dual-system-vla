@@ -70,8 +70,10 @@ class TrainConfig:
 
     log_every: int = 100
     checkpoint_every: int = 5_000
-    val_fraction: float = 0.1     # per task; 0 disables validation entirely
-    val_every: int = 1_000        # steps between validation passes
+    # Episodes withheld from training, per task, to score on. At 0 nothing is withheld
+    # and the scoring pass runs over training episodes instead — see `build_datasets`.
+    val_fraction: float = 0.1
+    val_every: int = 1_000        # steps between scoring passes; 0 disables them
     val_samples: int = 512        # bounds cost; spread across every task
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -119,12 +121,21 @@ def split_episodes(episodes: list[int], val_fraction: float) -> tuple[list[int],
 
 
 def build_datasets(cfg: TrainConfig):
-    """Return ``(train_dataset, val_dataset_or_None)``.
+    """Return ``(train_dataset, score_dataset_or_None, score_is_held_out)``.
 
-    The validation set exists only to choose a checkpoint and to reveal overfitting.
-    It is *not* the success metric: that is measured by rolling out in the simulator
-    from LIBERO's own initial states (see eval/trials.py), which no demonstration
-    starts from.
+    Which episodes are *trained on* and which are *scored* are separate choices.
+
+    At ``val_fraction > 0`` a stride of each task's episodes is withheld from training
+    and scored, giving a held-out loss that reveals overfitting. At ``val_fraction ==
+    0`` every episode trains, and the scoring pass runs over training episodes instead
+    — the loss it reports is in-sample, tracks the training loss, and says nothing
+    about generalisation. It still yields a smooth, fixed-sample series to select a
+    checkpoint from, which a per-step training loss over shuffled batches does not.
+
+    Neither number is the success metric. That is measured by rolling out in the
+    simulator from LIBERO's own initial states (see eval/trials.py), which no
+    demonstration starts from, and it does not track loss: configurations have scored
+    competitively here and failed in simulation.
     """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
@@ -151,15 +162,20 @@ def build_datasets(cfg: TrainConfig):
         val_episodes += task_val
 
     if cfg.overfit_episodes is not None:
-        # Smoke-test mode deliberately has no validation: the point is to memorise a
-        # handful of episodes, so a held-out loss would be meaningless.
+        # Smoke-test mode deliberately has no scoring pass: the point is to memorise a
+        # handful of episodes, so any loss over them is the training loss twice.
         train_episodes = sorted(train_episodes + val_episodes)[: cfg.overfit_episodes]
-        val_episodes = []
+        train_dataset = LeRobotDataset(REPO_ID, episodes=train_episodes, delta_timestamps=deltas)
+        return train_dataset, None, False
 
     train_dataset = LeRobotDataset(REPO_ID, episodes=sorted(train_episodes), delta_timestamps=deltas)
-    val_dataset = (LeRobotDataset(REPO_ID, episodes=sorted(val_episodes), delta_timestamps=deltas)
-                   if val_episodes else None)
-    return train_dataset, val_dataset
+    if val_episodes:
+        score_dataset = LeRobotDataset(REPO_ID, episodes=sorted(val_episodes),
+                                       delta_timestamps=deltas)
+        return train_dataset, score_dataset, True
+    # Nothing withheld: score the training episodes themselves. `validation_subset`
+    # strides across them, so the sample spans every task rather than the first few.
+    return train_dataset, train_dataset, False
 
 
 def split_batch(batch: dict) -> tuple[ModelObservation, list, torch.Tensor, torch.Tensor, list[str]]:
@@ -336,11 +352,15 @@ class MetricsLog:
                 "total_parameters": counts["total"],
             }) + "\n")
 
-    def log_validation(self, step: int, val_loss: float, is_best: bool) -> None:
+    def log_validation(self, step: int, val_loss: float, is_best: bool,
+                       held_out: bool = True) -> None:
         with self.path.open("a") as handle:
             handle.write(json.dumps({
                 "type": "validation",
                 "step": step,
+                # False when nothing was withheld from training: the loss is in-sample,
+                # and a plot that treats it as a generalisation curve would mislead.
+                "held_out": held_out,
                 "val_loss": round(val_loss, 6),
                 "is_best": is_best,
             }) + "\n")
@@ -408,17 +428,17 @@ def train(cfg: TrainConfig) -> Path:
     torch.manual_seed(cfg.seed)
     device = torch.device(cfg.device)
 
-    dataset, val_dataset = build_datasets(cfg)
+    dataset, score_dataset, score_is_held_out = build_datasets(cfg)
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=cfg.batch_size, shuffle=True,
         num_workers=cfg.num_workers, pin_memory=device.type == "cuda", drop_last=True,
     )
     val_loader = None
-    if val_dataset is not None:
+    if score_dataset is not None and cfg.val_every > 0:
         val_loader = torch.utils.data.DataLoader(
-            # Fixed, task-spanning subset; not shuffled, so successive validation losses
-            # differ because the model changed, not because the sample did.
-            validation_subset(val_dataset, cfg.val_samples),
+            # Fixed, task-spanning subset; not shuffled, so successive losses differ
+            # because the model changed, not because the sample did.
+            validation_subset(score_dataset, cfg.val_samples),
             batch_size=cfg.batch_size, shuffle=False,
             num_workers=max(1, cfg.num_workers // 2),
             pin_memory=device.type == "cuda", drop_last=False,
@@ -435,8 +455,14 @@ def train(cfg: TrainConfig) -> Path:
     )
 
     print(f"conditioning : {cfg.conditioning}")
-    held_out = val_dataset.num_episodes if val_dataset is not None else 0
-    print(f"episodes     : {dataset.num_episodes} train | {held_out} validation")
+    if score_dataset is None:
+        scoring = "none"
+    elif score_is_held_out:
+        scoring = f"{score_dataset.num_episodes} held-out episodes"
+    else:
+        scoring = "in-sample/nothing with-held"
+    print(f"episodes     : {dataset.num_episodes} train")
+    print(f"scored on    : {scoring}")
     print(f"trainable    : {counts['trainable'] / 1e6:.2f}M of {counts['total'] / 1e6:.2f}M")
     print(f"device       : {device}")
     print(f"metrics      : {output_dir / 'metrics.jsonl'}\n")
@@ -494,12 +520,14 @@ def train(cfg: TrainConfig) -> Path:
                 val_loss = validate(model, val_loader, device)
                 improved = val_loss < best_val
                 marker = "  <- best" if improved else f"  (best {best_val:.4f})"
-                print(f"step {step:>7d} |   val {val_loss:.4f}{marker}")
-                metrics.log_validation(step, val_loss, is_best=improved)
+                label = "val" if score_is_held_out else "in-sample"
+                print(f"step {step:>7d} | {label:>9s} {val_loss:.4f}{marker}")
+                metrics.log_validation(step, val_loss, is_best=improved,
+                                       held_out=score_is_held_out)
                 if improved:
                     best_val = val_loss
-                    # Written to a stable filename so evaluation never has to guess
-                    # which step generalised best from a directory of checkpoints.
+                    # A stable filename so evaluation never has to guess which step to
+                    # take from a directory of checkpoints.
                     save_checkpoint(model, cfg, step, output_dir,
                                     filename="best.pt", val_loss=val_loss)
             if step % cfg.checkpoint_every == 0:
@@ -549,11 +577,14 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--tiny", action="store_true",
                    help="small random models, for exercising the loop itself")
     p.add_argument("--val-fraction", type=float, default=0.1,
-                   help="fraction of each task's episodes held out for validation "
-                        "(default: 0.1; 0 disables). Used only to pick a checkpoint and "
-                        "reveal overfitting — the success metric comes from simulator "
-                        "rollouts against LIBERO's own initial states")
-    p.add_argument("--val-every", type=int, default=1000, help="steps between validation passes")
+                   help="fraction of each task's episodes held out from training and "
+                        "scored (default: 0.1). At 0 every episode trains and the "
+                        "scoring pass runs in-sample: best.pt is still written, but the "
+                        "loss says nothing about generalisation. Either way the success "
+                        "metric comes from simulator rollouts against LIBERO's own "
+                        "initial states")
+    p.add_argument("--val-every", type=int, default=1000,
+                   help="steps between scoring passes; 0 disables them and best.pt")
     p.add_argument("--val-samples", type=int, default=512,
                    help="validation samples per pass, strided across every task")
     p.add_argument("--log-every", type=int, default=100)

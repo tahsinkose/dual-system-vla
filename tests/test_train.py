@@ -305,11 +305,49 @@ def test_split_never_empties_the_training_set():
         assert len(train) > 4 * len(val), f"validation too large at {count} episodes"
 
 
-def test_zero_fraction_disables_validation():
+def test_zero_fraction_withholds_nothing():
     from src.train import split_episodes
 
     train, val = split_episodes(list(range(20)), 0.0)
     assert val == [] and train == list(range(20))
+
+
+def test_scoring_falls_back_to_the_training_episodes_when_nothing_is_withheld(monkeypatch):
+    """Training on everything must still produce a best.pt.
+
+    Which episodes train and which are scored are separate choices: at
+    `val_fraction=0` every episode trains and the scoring pass runs over those same
+    episodes, flagged so the number is never mistaken for a held-out one.
+    """
+    from src.train import TrainConfig, build_datasets
+
+    built = []
+
+    class _FakeDataset:
+        def __init__(self, repo_id, episodes=None, delta_timestamps=None):
+            self.episodes = list(episodes) if episodes is not None else None
+            built.append(self.episodes)
+
+        @property
+        def num_episodes(self):
+            return len(self.episodes)
+
+    monkeypatch.setattr("lerobot.datasets.lerobot_dataset.LeRobotDataset", _FakeDataset)
+    monkeypatch.setattr("lerobot.datasets.lerobot_dataset.LeRobotDatasetMetadata",
+                        lambda repo_id: type("M", (), {"fps": 10})())
+    monkeypatch.setattr("src.utils.episodes_for_task", lambda dataset, t: [0, 1, 2, 3, 4])
+
+    train_ds, score_ds, held_out = build_datasets(
+        TrainConfig(val_fraction=0.0, task_indices=[0]))
+    assert held_out is False
+    assert score_ds is train_ds                  # scored on what it trained on
+    assert train_ds.episodes == [0, 1, 2, 3, 4]  # nothing withheld
+
+    train_ds, score_ds, held_out = build_datasets(
+        TrainConfig(val_fraction=0.5, task_indices=[0]))
+    assert held_out is True
+    assert score_ds is not train_ds
+    assert set(train_ds.episodes) & set(score_ds.episodes) == set()
 
 
 def test_validation_restores_training_mode():

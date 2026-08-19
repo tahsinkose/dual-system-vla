@@ -53,6 +53,7 @@ from eval.perturbations import (  # noqa: E402
     apply_perturbation,
     snapshot_target_object_pose,
 )
+from eval.trials import DEFAULT_TRIALS_PER_TASK, InitSource, Trial, build_trials  # noqa: E402
 from eval.video import RolloutVideoWriter  # noqa: E402
 
 REPO_ID_DEFAULT = "lerobot/libero_10"
@@ -64,7 +65,9 @@ class EvalConfig:
     checkpoint: Path
     conditioning: str | None = None          # None -> use the checkpoint's trained mode
     task_indices: list[int] | None = None
-    episodes: list[int] | None = None        # explicit dataset episode indices; wins over task_indices
+    episodes: list[int] | None = None        # explicit dataset episode indices; demo source only
+    init_source: str = InitSource.BENCHMARK.value
+    trials_per_task: int = DEFAULT_TRIALS_PER_TASK
     perturb: str = "none"
     perturb_at_step: int | None = None
     perturb_after_success_steps: int | None = None
@@ -114,21 +117,15 @@ def build_env(task, camera_size: int, horizon: int):
     )
 
 
-def reset_episode(env, episode_index: int, settle_steps: int, allow_unmatched: bool) -> dict:
-    """Reset, optionally force the episode's exact recorded init state, then settle.
+def reset_episode(env, init_state, settle_steps: int) -> dict:
+    """Reset, force the trial's initial simulator state, then settle.
 
     Matches scripts/replay_episode.py's sequence: a different settle count changes
-    where objects land and silently produces a different effective task.
+    where objects land and silently produces a different effective task. `init_state`
+    may be None only for demo trials run with --allow-unmatched-episodes, which fall
+    back to the environment's own randomised reset.
     """
     obs = env.reset()
-    init_state = load_exact_init_state(episode_index)
-    if init_state is None and not allow_unmatched:
-        raise RuntimeError(
-            f"episode {episode_index} has no recovered init state (see "
-            "data/unmatched_episodes_per_task.json); pass --allow-unmatched-episodes "
-            "to run it from the env's own reset instead (object layout will differ "
-            "from the recording)."
-        )
     if init_state is not None:
         obs = env.set_init_state(init_state)
     for _ in range(settle_steps):
@@ -166,9 +163,7 @@ class TemporalOffsetBuffer:
 def run_episode(
     model: DualSystem,
     env,
-    episode_index: int,
-    instruction: str,
-    task_dataset_index: int,
+    trial: Trial,
     eval_conditioning: Conditioning,
     trained_conditioning: Conditioning,
     perturbation: PerturbationSpec,
@@ -185,7 +180,7 @@ def run_episode(
     discarded and recomputed next step; there is no chunk queue.
     """
     model.reset()
-    obs = reset_episode(env, episode_index, cfg.settle_steps, cfg.allow_unmatched_episodes)
+    obs = reset_episode(env, trial.init_state, cfg.settle_steps)
     snapshot = snapshot_target_object_pose(env)   # baseline for UNDO_PROGRESS
     scheduler = PerturbationScheduler(perturbation)
     rng = perturbation.make_rng()
@@ -197,7 +192,7 @@ def run_episode(
     video = None
     if cfg.video_dir is not None:
         video = RolloutVideoWriter(
-            cfg.video_dir / f"task{task_dataset_index}_ep{episode_index}.mp4",
+            cfg.video_dir / f"{trial.name}.mp4",
             eval_conditioning.value,
         )
     record_latents = cfg.latent_trace
@@ -216,7 +211,7 @@ def run_episode(
             buffer.push(canon.images["image"][0])
             system2_images = [buffer.offset_frame()]
 
-            actions, z = model.act(canon.images, canon.state, system2_images, [instruction],
+            actions, z = model.act(canon.images, canon.state, system2_images, [trial.instruction],
                                    conditioning=eval_conditioning)
             if record_latents:
                 latents_trace.append(z[0].cpu().numpy())
@@ -240,13 +235,13 @@ def run_episode(
                     # Deliberately uses the *immediate* current frame, not the
                     # Δ-offset one: this is an off-cadence diagnostic measuring
                     # "would S2 notice right now", not part of the control path.
-                    z_pre = model.compute_latent([buffer.latest_frame()], [instruction], probe_source)
+                    z_pre = model.compute_latent([buffer.latest_frame()], [trial.instruction], probe_source)
                 obs = apply_perturbation(env, perturbation.kind, rng, snapshot, perturbation.displacement_radius_m)
                 if env.check_success():
                     success = True
                 if eval_conditioning is not Conditioning.ZERO:
                     new_frame = from_env(obs).to(device).images["image"][0]
-                    z_post = model.compute_latent([new_frame], [instruction], probe_source)
+                    z_post = model.compute_latent([new_frame], [trial.instruction], probe_source)
                     cosine_distance = float(
                         1.0 - torch.nn.functional.cosine_similarity(z_pre, z_post).item()
                     )
@@ -264,7 +259,7 @@ def run_episode(
 
     latent_trace_path = None
     if record_latents and latents_trace:
-        latent_trace_path = cfg.log_path.parent / "latents" / f"task{task_dataset_index}_ep{episode_index}.npz"
+        latent_trace_path = cfg.log_path.parent / "latents" / f"{trial.name}.npz"
         write_latent_trace(latent_trace_path, np.stack(latents_trace), np.array(steps_since_update_trace))
 
     recovered = None
@@ -275,8 +270,8 @@ def run_episode(
             steps_to_recovery = first_success_after_trigger_step - trigger_step
 
     return EpisodeResult(
-        task_dataset_index=task_dataset_index, task_instruction=instruction,
-        episode_index=episode_index, seed=cfg.seed, checkpoint_path=checkpoint_path,
+        task_dataset_index=trial.task_dataset_index, task_instruction=trial.instruction,
+        episode_index=trial.index, seed=cfg.seed, checkpoint_path=checkpoint_path,
         trained_conditioning=trained_conditioning.value, eval_conditioning=eval_conditioning.value,
         success=success, steps_run=step_index,
         steps_to_success=scheduler.first_success_step,
@@ -289,27 +284,6 @@ def run_episode(
     )
 
 
-def resolve_episodes(cfg: EvalConfig, dataset, mapping: TaskMapping) -> list[int]:
-    """Dataset episode indices to run, in a fixed sorted order so repeated invocations
-    with the same flags (different --checkpoint/--conditioning) evaluate the identical
-    set — required for the ablation comparison to be over the same episodes.
-    """
-    if cfg.episodes is not None:
-        candidates = sorted(cfg.episodes)
-    else:
-        task_indices = cfg.task_indices if cfg.task_indices is not None else mapping.dataset_indices()
-        candidates = sorted(e for t in task_indices for e in episodes_for_task(dataset, t))
-
-    if cfg.allow_unmatched_episodes:
-        return candidates
-    resolved = [e for e in candidates if load_exact_init_state(e) is not None]
-    dropped = sorted(set(candidates) - set(resolved))
-    if dropped:
-        print(f"skipping {len(dropped)} episode(s) with no recovered init state: {dropped} "
-              "(see data/unmatched_episodes_per_task.json; pass --allow-unmatched-episodes to run anyway)")
-    return resolved
-
-
 def main(cfg: EvalConfig) -> list[EpisodeResult]:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -320,7 +294,16 @@ def main(cfg: EvalConfig) -> list[EpisodeResult]:
 
     dataset = LeRobotDataset(cfg.repo_id)
     mapping = TaskMapping.from_dataset(dataset)
-    episode_indices = resolve_episodes(cfg, dataset, mapping)
+    source = InitSource(cfg.init_source)
+    trials = build_trials(mapping, dataset, source,
+                          task_indices=cfg.task_indices,
+                          trials_per_task=cfg.trials_per_task,
+                          episodes=cfg.episodes,
+                          allow_unmatched=cfg.allow_unmatched_episodes)
+    if not trials:
+        raise SystemExit("no trials to run")
+    print(f"{len(trials)} trials from {source.value} initial states "
+          f"across {len({t.task_dataset_index for t in trials})} task(s)\n")
 
     perturb_kind = PerturbationKind(cfg.perturb)
     trigger = None
@@ -331,26 +314,23 @@ def main(cfg: EvalConfig) -> list[EpisodeResult]:
     writer = JsonlResultWriter(cfg.log_path)
     results: list[EpisodeResult] = []
     try:
-        for episode_index in episode_indices:
-            task = mapping.by_episode(dataset, episode_index)
-            instruction, _actions, _state = load_episode(dataset, episode_index)  # dataset's exact
-                                                                                    # string, matching training
+        for trial in trials:
+            task = mapping.by_dataset_index(trial.task_dataset_index)
             env = build_env(task, cfg.camera_size, cfg.horizon)
             spec = PerturbationSpec(kind=perturb_kind, trigger=trigger,
-                                    episode_seed=(cfg.seed, episode_index),
+                                    episode_seed=(cfg.seed, trial.index),
                                     displacement_radius_m=cfg.displacement_radius_m)
             try:
-                env.seed(0)   # matches scripts/replay_episode.py; per-episode determinism
-                              # comes from the exact init state and perturbation.episode_seed
-                result = run_episode(loaded.model, env, episode_index, instruction,
-                                     task.dataset_index, eval_conditioning,
+                env.seed(0)   # per-trial determinism comes from the forced init state
+                              # and perturbation.episode_seed, not the env seed
+                result = run_episode(loaded.model, env, trial, eval_conditioning,
                                      loaded.trained_conditioning, spec, cfg,
                                      str(loaded.checkpoint_path), device)
             finally:
                 env.close()
             writer.write(result)
             results.append(result)
-            print(f"episode {episode_index} (task {task.dataset_index}): "
+            print(f"{trial.name} (task {trial.task_dataset_index}): "
                   f"{'SUCCESS' if result.success else 'failure'} in {result.steps_run} steps")
     finally:
         writer.close()
@@ -367,6 +347,16 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
                    help="override the checkpoint's trained conditioning; default: use it as-is")
     p.add_argument("--task-indices", type=int, nargs="+", default=None,
                    help="restrict to these dataset task indices (default: all mapped tasks)")
+    p.add_argument("--init-source", choices=[s.value for s in InitSource],
+                   default=InitSource.BENCHMARK.value,
+                   help="'benchmark' (default) starts from LIBERO's own .pruned_init states — "
+                        "the standard protocol, and the only valid source for a reportable "
+                        "success rate, since no demonstration starts from one. 'demo' starts "
+                        "from a dataset episode's recovered state, which training has seen; "
+                        "use it for debugging against a known-good demonstration only")
+    p.add_argument("--trials-per-task", type=int, default=DEFAULT_TRIALS_PER_TASK,
+                   help=f"benchmark init states per task (default: {DEFAULT_TRIALS_PER_TASK}, "
+                        "LIBERO's published protocol)")
     p.add_argument("--episodes", type=int, nargs="+", default=None,
                    help="explicit dataset episode indices; overrides --task-indices")
     p.add_argument("--perturb", choices=[k.value for k in PerturbationKind], default="none")

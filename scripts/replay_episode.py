@@ -14,11 +14,18 @@ actions open-loop while an optional passive viewer syncs each step.
 No action conversion is applied — LIBERO demonstrations are already robosuite
 OSC_POSE-normalised 7-vectors, ready to step directly.
 
+``--subtasks`` additionally reports when each step of the task's decomposition
+(``eval/subtasks.py``) fires. A demonstration solves its task, so every subtask must
+complete during its replay; one that stays unreached is a decomposition bug rather
+than a policy failure, which makes this the check that validates the tables the
+evaluation harness logs against.
+
 Examples::
 
     python scripts/replay_episode.py --episode 8
     python scripts/replay_episode.py --episode 8 --viewer
     python scripts/replay_episode.py --episode 8 --video out/replay.mp4
+    python scripts/replay_episode.py --episode 8 --subtasks
 """
 
 from __future__ import annotations
@@ -43,6 +50,8 @@ from src.utils import (  # noqa: E402
     load_exact_init_state,
 )
 
+from eval.subtasks import SubtaskTracker, subtasks_for  # noqa: E402
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -60,11 +69,17 @@ def parse_args() -> argparse.Namespace:
                    help="No-op steps after reset to let objects settle, matching LiberoEnv's "
                         "num_steps_wait (default: 10)")
     p.add_argument("--realtime", action="store_true", help="Throttle the viewer to wall-clock speed")
+    p.add_argument("--subtasks", action="store_true",
+                   help="Report the step at which each subtask of the task completes")
     return p.parse_args()
 
 
-def replay(env, actions, init_state, recorded_state, args) -> tuple[bool, int, float]:
-    """Step recorded actions open-loop. Returns (success, steps_taken, mean_tracking_error)."""
+def replay(env, actions, init_state, recorded_state, args, subtasks=None):
+    """Step recorded actions open-loop.
+
+    Returns (success, steps_taken, mean_tracking_error, tracker), where `tracker` is
+    None unless `subtasks` was given.
+    """
     from contextlib import nullcontext
 
     import numpy as np
@@ -76,6 +91,10 @@ def replay(env, actions, init_state, recorded_state, args) -> tuple[bool, int, f
     # matching what LiberoEnv does at the start of every evaluation episode.
     for _ in range(args.settle_steps):
         env.step(DUMMY_ACTION)
+
+    # Built after settling, so a condition reported as already satisfied really was
+    # satisfied by the initial layout rather than by the objects still moving.
+    tracker = SubtaskTracker(subtasks, env) if subtasks else None
 
     trace = []
     frames = []
@@ -94,6 +113,8 @@ def replay(env, actions, init_state, recorded_state, args) -> tuple[bool, int, f
             for _ in range(args.action_repeat):
                 obs, _reward, done, _info = env.step(np.asarray(action, dtype=np.float64))
                 steps += 1
+                if tracker is not None:
+                    tracker.update(steps - 1)
                 trace.append(obs["robot0_eef_pos"].copy())
                 if args.video is not None:
                     frames.append(agentview_upright(obs["agentview_image"]))
@@ -115,7 +136,26 @@ def replay(env, actions, init_state, recorded_state, args) -> tuple[bool, int, f
         write_video(frames, args.video)
     trace = np.array(trace)
     error = float(np.linalg.norm(trace - recorded_state[:len(trace), :3], axis=1).mean()) if len(trace) else float("nan")
-    return success, steps, error
+    return success, steps, error, tracker
+
+
+def print_subtasks(tracker) -> None:
+    """One line per subtask, in task order, with the step it first completed at."""
+    records = tracker.records()
+    width = max(len(r.description) for r in records)
+    print(f"  subtasks: {tracker.n_achieved}/{tracker.n_total}")
+    for record in records:
+        if record.achieved_at_reset:
+            status = "satisfied at reset"
+        elif record.first_achieved_step is None:
+            status = "NOT REACHED"
+        else:
+            status = f"step {record.first_achieved_step}"
+            if not record.achieved_at_end:
+                # Expected for a grasp, which ends when the object is released, and a
+                # signal worth seeing for a placement a later manipulation disturbed.
+                status += ", not held at end"
+        print(f"    {record.description:<{width}}  {status}")
 
 
 def write_video(frames, path: Path) -> None:
@@ -168,14 +208,18 @@ def main() -> int:
         # Demonstrations can exceed the default horizon; replay should not be cut short.
         horizon=len(actions) * args.action_repeat + args.settle_steps + 100,
     )
+    subtasks = subtasks_for(task.bddl) if args.subtasks else None
     try:
         env.seed(0)
-        success, steps, error = replay(env, actions, init_state, recorded_state, args)
+        success, steps, error, tracker = replay(env, actions, init_state, recorded_state,
+                                                args, subtasks)
     finally:
         env.close()
 
     print(f"  -> {'SUCCESS' if success else 'FAILURE'} after {steps} steps, "
           f"mean eef tracking error {error:.4f} m")
+    if tracker is not None:
+        print_subtasks(tracker)
     return 0 if success else 2
 
 

@@ -25,6 +25,7 @@ from src.train import (  # noqa: E402
     build_delta_timestamps,
     build_model,
     build_optimizer,
+    action_loss,
     masked_l1_loss,
     parse_args,
     split_batch,
@@ -159,9 +160,14 @@ def test_a_training_step_moves_system2_adapters():
     before = {n: p.detach().clone() for n, p in lora.items()}
 
     images = {k: torch.rand(2, 3, 32, 32) for k in model.config.system1.camera_keys}
-    predicted, _ = model(images, torch.rand(2, 8), [torch.rand(3, 32, 32)] * 2,
-                         ["do the thing"] * 2)
-    loss = masked_l1_loss(predicted, torch.rand(2, 4, 7), torch.zeros(2, 4, dtype=torch.bool))
+    actions = torch.rand(2, 4, 7)
+    is_pad = torch.zeros(2, 4, dtype=torch.bool)
+    model.train()
+    predicted, _latent, style_latent = model(
+        images, torch.rand(2, 8), [torch.rand(3, 32, 32)] * 2, ["do the thing"] * 2,
+        actions=actions, action_is_pad=is_pad)
+    loss, _ = action_loss(predicted, model.system1.normalise_action(actions), is_pad,
+                          style_latent, cfg.kl_weight)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
@@ -191,9 +197,8 @@ def test_loss_matches_acts_formulation():
     Ours expands the mask to element count instead of multiplying — the same divisor,
     but a refactor could easily change one and not the other, so it is pinned here.
 
-    ACT's full objective adds `kl_weight * kld` on top, gated on `use_vae`. That term
-    regularises the CVAE's style latent, so it cannot be adopted separately from the
-    CVAE itself (Alternative Improvements, lever 2).
+    Only the reconstruction half is checked here; `test_objective_matches_acts_full_loss`
+    pins the KLD term on top of it.
     """
     import torch.nn.functional as F
 
@@ -208,6 +213,57 @@ def test_loss_matches_acts_formulation():
         reference = (abs_err * valid_mask).sum() / num_valid.clamp_min(1)
 
         torch.testing.assert_close(masked_l1_loss(predicted, target, is_pad), reference)
+
+
+def test_objective_matches_acts_full_loss():
+    """The whole objective, not just its reconstruction half.
+
+    System 1 wraps ACT's inner module rather than `ACTPolicy`, which means the KLD term
+    `ACTPolicy` would have computed is this training loop's responsibility. Getting the
+    weighting or the reduction wrong would still produce a falling curve, so it is
+    pinned against upstream's own formulation: sum over the style latent's dimensions,
+    mean over the batch, scaled by `kl_weight`.
+    """
+    import torch.nn.functional as F
+
+    from src.train import action_loss
+
+    torch.manual_seed(0)
+    kl_weight = 10.0
+    for _ in range(5):
+        predicted, target = torch.randn(3, 8, 7), torch.randn(3, 8, 7)
+        is_pad = torch.rand(3, 8) < 0.4
+        mu, log_sigma_x2 = torch.randn(3, 32), torch.randn(3, 32)
+
+        abs_err = F.l1_loss(target, predicted, reduction="none")
+        valid_mask = ~is_pad.unsqueeze(-1)
+        num_valid = valid_mask.sum() * abs_err.shape[-1]
+        reference_l1 = (abs_err * valid_mask).sum() / num_valid.clamp_min(1)
+        reference_kld = (
+            -0.5 * (1 + log_sigma_x2 - mu.pow(2) - log_sigma_x2.exp())
+        ).sum(-1).mean()
+
+        loss, components = action_loss(predicted, target, is_pad,
+                                       (mu, log_sigma_x2), kl_weight)
+        torch.testing.assert_close(loss, reference_l1 + kl_weight * reference_kld)
+        assert components["l1"] == pytest.approx(reference_l1.item())
+        assert components["kld"] == pytest.approx(reference_kld.item())
+
+
+def test_objective_drops_the_kld_term_at_inference():
+    """With the style latent zeroed there is no distribution to regularise.
+
+    Validation runs in eval mode, so its loss must be the reconstruction term alone —
+    otherwise it would not be comparable to the training curve's `l1`.
+    """
+    from src.train import action_loss
+
+    predicted, target = torch.randn(2, 4, 7), torch.randn(2, 4, 7)
+    is_pad = torch.zeros(2, 4, dtype=torch.bool)
+    loss, components = action_loss(predicted, target, is_pad, (None, None), 10.0)
+
+    torch.testing.assert_close(loss, masked_l1_loss(predicted, target, is_pad))
+    assert components["kld"] == 0.0
 
 
 # ------------------------------------------------------------ validation split

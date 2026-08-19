@@ -97,11 +97,14 @@ def tiny_config(**overrides) -> DualSystemConfig:
 class DualSystem(nn.Module):
     """System 2 → latent → System 1, trained end-to-end."""
 
-    def __init__(self, config: DualSystemConfig | None = None) -> None:
+    def __init__(self, config: DualSystemConfig | None = None,
+                 system1_stats=None) -> None:
         super().__init__()
         self.config = config or DualSystemConfig()
         self.system2 = System2(self.config.system2)
-        self.system1 = System1(self.config.system1)
+        # Statistics are needed only when building a model to train: they are persistent
+        # buffers, so restoring a checkpoint carries whatever the run was trained with.
+        self.system1 = System1(self.config.system1, system1_stats)
 
         # Rollout state, reset per episode. Kept off the module's parameters so it
         # never leaks into checkpoints.
@@ -167,8 +170,10 @@ class DualSystem(nn.Module):
         system2_images,
         instructions: list[str],
         conditioning: Conditioning | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One end-to-end pass. Returns ``(actions, latent)``.
+        actions: torch.Tensor | None = None,
+        action_is_pad: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor | None, torch.Tensor | None]]:
+        """One end-to-end pass. Returns ``(actions, latent, style_latent_params)``.
 
         Args:
             images: System 1's cameras at time t — key -> ``(B, 3, H, W)`` in [0, 1].
@@ -179,14 +184,22 @@ class DualSystem(nn.Module):
                 no language input.
             conditioning: overrides the configured mode, for evaluating one checkpoint
                 under several ablation modalities.
+            actions, action_is_pad: the ground-truth chunk and its padding mask, which
+                System 1's CVAE encoder consumes during training. Omitted at inference.
+
+        The predicted actions are in **normalised** action space — the space the loss is
+        computed in. `act()` is the path that returns environment-ready actions.
 
         The latent is returned alongside the actions because the ablation needs it:
         the pre/post-perturbation cosine distance is the quantitative evidence that
-        System 2 noticed a mid-rollout change.
+        System 2 noticed a mid-rollout change. The style latent's distribution
+        parameters come back too, because the KLD term that regularises them belongs to
+        the training loop rather than to the model.
         """
         latent = self.compute_latent(system2_images, instructions, conditioning)
-        actions = self.system1(images, state, latent)
-        return actions, latent
+        predicted, style_latent_params = self.system1(images, state, latent,
+                                                      actions, action_is_pad)
+        return predicted, latent, style_latent_params
 
     # ------------------------------------------------------------------ rollout path
 
@@ -206,6 +219,9 @@ class DualSystem(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Rollout step with the latent held between updates. Returns ``(actions, z)``.
 
+        Actions come back in the environment's units, unlike `forward`, which stays in
+        the normalised space the loss is computed in.
+
         The update schedule *is* the dual-system premise: System 2 runs every K steps,
         System 1 every step. FROZEN is the same machinery with an unbounded period —
         computed once, never refreshed.
@@ -222,7 +238,18 @@ class DualSystem(nn.Module):
             self._steps_since_update = 0
         self._steps_since_update += 1
 
-        return self.system1(images, state, self._cached_latent), self._cached_latent
+        # System 1 is forced into inference mode for the duration, for the same reason
+        # this method is `no_grad`: it is the rollout path by definition, and both
+        # dropout and the CVAE encoder are training-only machinery whose presence would
+        # change the actions a rollout produces without changing anything visible.
+        was_training = self.system1.training
+        self.system1.eval()
+        try:
+            # Unnormalised, because this is the path whose output reaches `env.step`.
+            predicted, _ = self.system1(images, state, self._cached_latent)
+        finally:
+            self.system1.train(was_training)
+        return self.system1.unnormalise_action(predicted), self._cached_latent
 
     @property
     def steps_since_latent_update(self) -> int:
@@ -245,8 +272,9 @@ if __name__ == "__main__":
     print(f"trainable {counts['trainable'] / 1e6:6.2f}M of {counts['total'] / 1e6:.2f}M")
 
     cfg = model.config.system1
+    model.eval()
     images = {k: torch.rand(1, 3, 128, 128) for k in cfg.camera_keys}
-    actions, latent = model(
+    actions, latent, _ = model(
         images, torch.rand(1, cfg.state_dim), [torch.rand(3, 128, 128)],
         ["put both the alphabet soup and the tomato sauce in the basket"],
     )

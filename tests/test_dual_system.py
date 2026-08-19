@@ -29,7 +29,10 @@ INSTRUCTION = "put both the alphabet soup and the tomato sauce in the basket"
 
 @pytest.fixture(scope="module")
 def model() -> DualSystem:
-    return DualSystem(tiny_config())
+    """Inference mode: System 1's CVAE encoder runs only in training mode, and demands
+    the ground-truth action chunk when it does. Tests that need it opt in via
+    `supervision()`."""
+    return DualSystem(tiny_config()).eval()
 
 
 def observation(model: DualSystem, batch: int = 1, size: int = 128):
@@ -42,14 +45,41 @@ def observation(model: DualSystem, batch: int = 1, size: int = 128):
     )
 
 
+def supervision(model: DualSystem, batch: int = 1):
+    """The ground-truth chunk and padding mask System 1's CVAE encoder consumes."""
+    cfg = model.config.system1
+    return (torch.rand(batch, cfg.chunk_size, cfg.action_dim),
+            torch.zeros(batch, cfg.chunk_size, dtype=torch.bool))
+
+
 # ------------------------------------------------------------------------ wiring
 
 
-def test_forward_returns_actions_and_latent(model):
+def test_forward_returns_actions_latent_and_style_latent(model):
     images, state, s2_images, instructions = observation(model)
-    actions, latent = model(images, state, s2_images, instructions)
+    actions, latent, style_latent = model(images, state, s2_images, instructions)
     assert actions.shape == (1, model.config.system1.chunk_size, model.config.system1.action_dim)
     assert latent.shape == (1, model.config.system1.latent_dim)
+    # Zeroed at inference, so its distribution parameters have no value to report.
+    assert style_latent == (None, None)
+
+
+def test_forward_infers_the_style_latent_when_training(model):
+    """The CVAE parameters come back so the training loop can add the KLD term.
+
+    The loss lives outside the model — that is what keeps one forward serving both
+    training and rollout — so the term's operands have to cross the boundary.
+    """
+    images, state, s2_images, instructions = observation(model)
+    actions, is_pad = supervision(model)
+    model.train()
+    try:
+        _, _, (mu, log_sigma_x2) = model(images, state, s2_images, instructions,
+                                         actions=actions, action_is_pad=is_pad)
+    finally:
+        model.eval()
+    assert mu is not None and log_sigma_x2 is not None
+    assert mu.shape == (1, model.config.system1.style_latent_dim)
 
 
 def test_gradients_reach_system2_through_the_latent(model):
@@ -61,7 +91,7 @@ def test_gradients_reach_system2_through_the_latent(model):
     """
     model.zero_grad(set_to_none=True)
     images, state, s2_images, instructions = observation(model)
-    actions, _ = model(images, state, s2_images, instructions)
+    actions, _, _ = model(images, state, s2_images, instructions)
     actions.sum().backward()
 
     lora = [p for n, p in model.system2.named_parameters()

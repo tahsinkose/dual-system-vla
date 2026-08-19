@@ -3,173 +3,239 @@
 Consumes camera frames, proprioception, and System 2's latent `z`, and emits a chunk of
 actions. Runs every environment step (~20 Hz), against System 2's ~1-2 Hz.
 
-Structure, following the DETR/ACT pattern:
+The policy itself is LeRobot's ACT (`lerobot.policies.act.modeling_act.ACT`): a
+ResNet-18 backbone over each camera, a transformer encoder over the resulting tokens, a
+decoder with one learned query per chunk step, and a linear action head, plus a CVAE
+whose style latent is inferred from the action sequence during training and zeroed at
+inference. This module owns three things ACT does not:
 
-* a **shared convolutional backbone** over both camera views, taking feature maps from
-  several stages so the encoder sees multiple spatial scales;
-* an **encoder** over the concatenation of visual tokens, a proprioception token, and
-  the projected latent tokens;
-* a **decoder** with one learned query per action-chunk step, cross-attending to that
-  memory;
-* a linear head mapping each query to a 7-dim action.
+* **the `z` token** — System 2's latent projected into ACT's `dim_model` and inserted
+  into its encoder sequence;
+* **normalisation** — the dataset statistics ACT is trained against, carried as buffers
+  so a checkpoint is self-contained;
+* **the calling convention** — positional observations rather than a feature-keyed
+  batch dictionary, which is what the rest of this repo passes around.
 
-The backbone is shared across cameras rather than duplicated: it halves the parameter
-count and the two LIBERO views are similar enough in statistics that separate weights
-buy little.
+**There is no language input.** All instruction content reaches this model through `z`
+and nowhere else; ACT has no text encoder and no language feature, so the constraint
+holds structurally rather than by convention.
+
+Two different things are called "latent" in the code below and they must not be
+confused. **`z`** is System 2's semantic latent — the interface this study is about,
+live at inference. **The style latent** is ACT's own CVAE variable, inferred from the
+ground-truth action sequence and zeroed at inference. `z` never enters the CVAE
+encoder, which reads only ``[cls, state, actions]``; a test pins that.
+
+Wrapping the inner `ACT` module rather than `ACTPolicy` keeps the loss out of the model:
+`forward` stays a function of observations, so one forward serves both training and
+rollout and one checkpoint runs under every conditioning modality. The KLD term that
+`ACTPolicy` would have computed belongs to the training loop instead, which is why the
+CVAE distribution parameters are returned rather than consumed here.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch import nn
-from torchvision.models import ResNet18_Weights, resnet18
-from torchvision.ops.misc import FrozenBatchNorm2d
 
-# ImageNet statistics from torchvision, required because the backbone is ImageNet-initialised.
-IMAGENET_MEAN = ResNet18_Weights.IMAGENET1K_V1.transforms().mean
-IMAGENET_STD = ResNet18_Weights.IMAGENET1K_V1.transforms().std
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act.modeling_act import ACT
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
-# Output channels of the ResNet-18 stages this model reads from.
-RESNET18_STAGE_CHANNELS = {"layer2": 128, "layer3": 256, "layer4": 512}
+# Where `z` rides into ACT.
+#
+# ACT assembles its 1-D encoder tokens from a fixed list — style latent, robot state,
+# environment state — with no extension point. The environment-state slot is the one
+# that fits: an optional input of arbitrary width, given its own `nn.Linear` projection
+# and its own row of `encoder_1d_feature_pos_embed`, appended to the encoder sequence
+# and *excluded from the CVAE encoder*. That last property is the reason to prefer the
+# slot over a reimplementation: the isolation of `z` from the style latent is enforced
+# by upstream's own control flow rather than by code here that could drift out of step
+# with it.
+#
+# The name is upstream's and is inaccurate for this use — nothing about `z` is a
+# simulator state. It is aliased once, here, and every reference below goes through the
+# alias.
+LATENT_SLOT = OBS_ENV_STATE
+
+# Canonical camera key -> the dataset feature name whose statistics normalise it.
+DATASET_IMAGE_FEATURES = {"image": "observation.images.image",
+                          "image2": "observation.images.wrist_image"}
 
 
 @dataclass
 class System1Config:
-    latent_dim: int = 512          # must match System2Config.latent_dim
+    """System 1's own configuration, from which an `ACTConfig` is derived.
+
+    Kept separate from `ACTConfig` so that the constructor surface the rest of the repo
+    builds against — and therefore what strict checkpoint loading has to reproduce —
+    does not track an upstream dataclass with ~30 fields, most of them irrelevant here
+    (normalisation mapping, optimiser preset, inference-time action stepping).
+    """
+
+    latent_dim: int = 512          # `z`; must match System2Config.latent_dim
     state_dim: int = 8             # eef xyz, axis-angle, 2x gripper qpos
     action_dim: int = 7            # 6D eef delta + gripper
-    chunk_size: int = 16           # actions predicted per forward pass
+    chunk_size: int = 100          # actions predicted per forward pass
 
-    d_model: int = 512
+    dim_model: int = 512
     n_heads: int = 8
-    n_encoder_layers: int = 8
-    n_decoder_layers: int = 8
-    dim_feedforward: int = 2048
+    dim_feedforward: int = 3200
+    n_encoder_layers: int = 4
+    # Upstream ships 1 against the paper's 7: only the first decoder layer was ever
+    # used in the original implementation, and LeRobot matches the behaviour rather
+    # than the number.
+    n_decoder_layers: int = 1
     dropout: float = 0.1
+    pre_norm: bool = False
 
-    # Which backbone stages feed the encoder. Later stages are semantically richer but
-    # spatially coarser; including earlier ones preserves the fine detail that precise
-    # manipulation needs.
-    backbone_stages: tuple[str, ...] = ("layer3", "layer4")
+    vision_backbone: str = "resnet18"
     pretrained_backbone: bool = True
 
-    # How many tokens the latent expands into. One is enough for a global conditioning
-    # signal; more gives the decoder somewhere to attend differentially.
-    n_latent_tokens: int = 1
+    # ACT's CVAE. `style_latent_dim` is deliberately *not* called `latent_dim`.
+    use_vae: bool = True
+    style_latent_dim: int = 32
+    n_vae_encoder_layers: int = 4
 
     camera_keys: tuple[str, ...] = ("image", "image2")
 
-    def __post_init__(self) -> None:
-        for stage in self.backbone_stages:
-            if stage not in RESNET18_STAGE_CHANNELS:
-                raise ValueError(f"unknown backbone stage {stage!r}; "
-                                 f"expected one of {sorted(RESNET18_STAGE_CHANNELS)}")
+    def act_config(self) -> ACTConfig:
+        """The upstream configuration this wraps.
+
+        `normalization_mapping` is set to IDENTITY throughout: normalisation happens in
+        `System1` against buffers it owns, so a checkpoint carries its own statistics
+        instead of depending on processor files stored beside it.
+        """
+        input_features = {
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(self.state_dim,)),
+            LATENT_SLOT: PolicyFeature(type=FeatureType.ENV, shape=(self.latent_dim,)),
+        }
+        for key in self.camera_keys:
+            input_features[f"observation.images.{key}"] = PolicyFeature(
+                type=FeatureType.VISUAL, shape=(3, 256, 256))
+
+        return ACTConfig(
+            chunk_size=self.chunk_size,
+            n_action_steps=self.chunk_size,
+            input_features=input_features,
+            output_features={ACTION: PolicyFeature(type=FeatureType.ACTION,
+                                                   shape=(self.action_dim,))},
+            normalization_mapping={"VISUAL": NormalizationMode.IDENTITY,
+                                   "STATE": NormalizationMode.IDENTITY,
+                                   "ENV": NormalizationMode.IDENTITY,
+                                   "ACTION": NormalizationMode.IDENTITY},
+            vision_backbone=self.vision_backbone,
+            pretrained_backbone_weights=("ResNet18_Weights.IMAGENET1K_V1"
+                                         if self.pretrained_backbone else None),
+            pre_norm=self.pre_norm,
+            dim_model=self.dim_model,
+            n_heads=self.n_heads,
+            dim_feedforward=self.dim_feedforward,
+            n_encoder_layers=self.n_encoder_layers,
+            n_decoder_layers=self.n_decoder_layers,
+            use_vae=self.use_vae,
+            latent_dim=self.style_latent_dim,
+            n_vae_encoder_layers=self.n_vae_encoder_layers,
+            dropout=self.dropout,
+        )
 
 
 def tiny_config(**overrides) -> System1Config:
     """Small configuration for tests — no pretrained download, few layers."""
     defaults = dict(
-        latent_dim=32, d_model=64, n_heads=4, n_encoder_layers=2, n_decoder_layers=2,
-        dim_feedforward=128, chunk_size=4, pretrained_backbone=False,
+        latent_dim=32, dim_model=64, n_heads=4, dim_feedforward=128,
+        n_encoder_layers=2, n_decoder_layers=1, n_vae_encoder_layers=1,
+        style_latent_dim=8, chunk_size=4, pretrained_backbone=False,
     )
     defaults.update(overrides)
     return System1Config(**defaults)
 
 
-class MultiScaleBackbone(nn.Module):
-    """ResNet-18 trunk exposing several stages as flat token sequences."""
+@dataclass
+class NormalisationStats:
+    """Per-feature mean and standard deviation, in the model's input space.
 
-    def __init__(self, config: System1Config) -> None:
-        super().__init__()
-        weights = ResNet18_Weights.IMAGENET1K_V1 if config.pretrained_backbone else None
-        # FrozenBatchNorm keeps the ImageNet statistics fixed rather than re-estimating
-        # them — what ACT and DETR do, for three reasons that all apply here:
-        #   * BatchNorm is one of the few layers that behaves *differently* in train and
-        #     eval mode (batch statistics vs accumulated running ones). Drift between the
-        #     two shows up as a policy that evaluates worse than it trained, with nothing
-        #     obvious to point at.
-        #   * Rollouts step one environment at a time, so batch statistics would be
-        #     computed over a single sample.
-        #   * ImageNet statistics are a better prior than ones re-estimated from a few
-        #     hundred episodes of narrow robot data at modest batch sizes.
-        resnet = resnet18(weights=weights, norm_layer=FrozenBatchNorm2d)
+    `images` is keyed by canonical camera key and holds `(3, 1, 1)` tensors; `state`
+    and `action` hold `(state_dim,)` and `(action_dim,)`.
+    """
 
-        self.stem = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
-        self.layer1, self.layer2 = resnet.layer1, resnet.layer2
-        self.layer3, self.layer4 = resnet.layer3, resnet.layer4
-        self.stages = config.backbone_stages
+    state: tuple[torch.Tensor, torch.Tensor]
+    action: tuple[torch.Tensor, torch.Tensor]
+    images: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
 
-        # One 1x1 projection per stage, since each has a different channel count.
-        self.projections = nn.ModuleDict({
-            stage: nn.Conv2d(RESNET18_STAGE_CHANNELS[stage], config.d_model, kernel_size=1)
-            for stage in self.stages
-        })
+    @classmethod
+    def from_dataset(cls, dataset_meta, config: System1Config) -> "NormalisationStats":
+        """Read the statistics LeRobot computed over the dataset.
 
-        self.register_buffer("mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1), persistent=False)
-        self.register_buffer("std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1), persistent=False)
+        These are the same numbers the policy's processor files would hold; taking them
+        from the dataset metadata rather than from a sidecar keeps train and eval on one
+        source.
+        """
+        stats = dataset_meta.stats
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """``(B, 3, H, W)`` in [0, 1] -> ``(B, tokens, d_model)``."""
-        x = (images - self.mean) / self.std
-        x = self.layer1(self.stem(x))
-        outputs = {}
-        x = self.layer2(x)
-        outputs["layer2"] = x
-        x = self.layer3(x)
-        outputs["layer3"] = x
-        x = self.layer4(x)
-        outputs["layer4"] = x
+        def pair(key):
+            entry = stats[key]
+            return (torch.as_tensor(entry["mean"], dtype=torch.float32),
+                    torch.as_tensor(entry["std"], dtype=torch.float32))
 
-        tokens = []
-        for stage in self.stages:
-            feature = self.projections[stage](outputs[stage])       # B, d_model, h, w
-            tokens.append(feature.flatten(2).transpose(1, 2))       # B, h*w, d_model
-        return torch.cat(tokens, dim=1)
+        return cls(
+            state=pair(OBS_STATE),
+            action=pair(ACTION),
+            images={key: pair(DATASET_IMAGE_FEATURES[key]) for key in config.camera_keys},
+        )
+
+    @classmethod
+    def identity(cls, config: System1Config) -> "NormalisationStats":
+        """Statistics that leave every input untouched, for tests and bring-up."""
+        return cls(
+            state=(torch.zeros(config.state_dim), torch.ones(config.state_dim)),
+            action=(torch.zeros(config.action_dim), torch.ones(config.action_dim)),
+            images={key: (torch.zeros(3, 1, 1), torch.ones(3, 1, 1))
+                    for key in config.camera_keys},
+        )
+
+
+# Guards against dividing by a statistic that is zero because a dimension never varies.
+_STD_FLOOR = 1e-6
 
 
 class System1(nn.Module):
     """Latent-conditioned action-chunk policy. No language input."""
 
-    def __init__(self, config: System1Config | None = None) -> None:
+    def __init__(self, config: System1Config | None = None,
+                 stats: NormalisationStats | None = None) -> None:
         super().__init__()
         self.config = config or System1Config()
         cfg = self.config
+        self.act = ACT(cfg.act_config())
 
-        self.backbone = MultiScaleBackbone(cfg)
-        self.state_projection = nn.Linear(cfg.state_dim, cfg.d_model)
-        self.latent_projection = nn.Linear(cfg.latent_dim, cfg.d_model * cfg.n_latent_tokens)
+        stats = stats or NormalisationStats.identity(cfg)
+        self._register_stat("state", *stats.state)
+        self._register_stat("action", *stats.action)
+        for key in cfg.camera_keys:
+            self._register_stat(f"image_{key}", *stats.images[key])
 
-        # Learned embeddings marking token provenance (camera i / state / latent), so
-        # the encoder can tell an image patch from proprioception after concatenation.
-        self.token_type_embedding = nn.Embedding(len(cfg.camera_keys) + 2, cfg.d_model)
-        self.position_embedding = nn.Parameter(torch.zeros(1, 2048, cfg.d_model))
-        nn.init.trunc_normal_(self.position_embedding, std=0.02)
+    def _register_stat(self, name: str, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """Statistics are persistent buffers: a checkpoint carries its own.
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=cfg.d_model, nhead=cfg.n_heads, dim_feedforward=cfg.dim_feedforward,
-            dropout=cfg.dropout, batch_first=True, norm_first=True,
-        )
-        # enable_nested_tensor is incompatible with norm_first and only warns; disabled
-        # explicitly since every sequence here is dense anyway (no padding mask).
-        self.encoder = nn.TransformerEncoder(encoder_layer, cfg.n_encoder_layers,
-                                             enable_nested_tensor=False)
+        Loading weights trained under one normalisation and applying another silently
+        shifts every input and every action the policy emits, with nothing to raise.
+        """
+        self.register_buffer(f"{name}_mean", mean.clone().float())
+        self.register_buffer(f"{name}_std", std.clone().float().clamp_min(_STD_FLOOR))
 
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=cfg.d_model, nhead=cfg.n_heads, dim_feedforward=cfg.dim_feedforward,
-            dropout=cfg.dropout, batch_first=True, norm_first=True,
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, cfg.n_decoder_layers)
+    # ----------------------------------------------------------------- normalisation
 
-        # One query per timestep of the predicted chunk.
-        self.action_queries = nn.Parameter(torch.zeros(1, cfg.chunk_size, cfg.d_model))
-        nn.init.trunc_normal_(self.action_queries, std=0.02)
+    def normalise_action(self, actions: torch.Tensor) -> torch.Tensor:
+        """Raw actions -> the space the model predicts in."""
+        return (actions - self.action_mean) / self.action_std
 
-        # Left unsquashed: the loss is a regression onto recorded actions that already
-        # lie in [-1, 1], and a tanh here would flatten gradients near the range limits
-        # exactly where the gripper commands live. Clamping belongs at the env boundary.
-        self.action_head = nn.Linear(cfg.d_model, cfg.action_dim)
+    def unnormalise_action(self, actions: torch.Tensor) -> torch.Tensor:
+        """Model output -> the space the environment accepts."""
+        return actions * self.action_std + self.action_mean
 
     # ----------------------------------------------------------------------- forward
 
@@ -178,17 +244,29 @@ class System1(nn.Module):
         images: dict[str, torch.Tensor],
         state: torch.Tensor,
         latent: torch.Tensor,
-    ) -> torch.Tensor:
+        actions: torch.Tensor | None = None,
+        action_is_pad: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, torch.Tensor | None]]:
         """Predict an action chunk.
 
         Args:
             images: camera key -> ``(B, 3, H, W)`` float tensors in [0, 1]. Keys must
                 cover ``config.camera_keys``.
-            state: ``(B, state_dim)`` proprioception.
-            latent: ``(B, latent_dim)`` — System 2's output.
+            state: ``(B, state_dim)`` proprioception, unnormalised.
+            latent: ``(B, latent_dim)`` — System 2's `z`.
+            actions: ``(B, chunk_size, action_dim)`` ground truth, unnormalised.
+                Required in training mode when the CVAE is enabled — it is the CVAE
+                encoder's input — and ignored at inference, where the style latent is
+                zeroed.
+            action_is_pad: ``(B, chunk_size)`` bool, marking chunk steps that ran past
+                the end of their episode. Required alongside `actions`: it is the CVAE
+                encoder's key-padding mask, and without it the style latent is inferred
+                partly from padding.
 
         Returns:
-            ``(B, chunk_size, action_dim)``.
+            ``(actions, (mu, log_sigma_x2))`` — the chunk **in normalised action
+            space**, and the style latent's distribution parameters, both `None`
+            outside CVAE training. The caller owns the loss, including its KLD term.
 
         Note the absence of any text argument: see the module docstring.
         """
@@ -196,54 +274,51 @@ class System1(nn.Module):
         missing = [k for k in cfg.camera_keys if k not in images]
         if missing:
             raise KeyError(f"missing camera views {missing}; got {sorted(images)}")
-
-        batch_size = state.shape[0]
-        tokens, type_ids = [], []
-
-        for index, key in enumerate(cfg.camera_keys):
-            visual = self.backbone(images[key])
-            tokens.append(visual)
-            type_ids.append(torch.full((visual.shape[1],), index, device=visual.device))
-
-        state_token = self.state_projection(state).unsqueeze(1)
-        tokens.append(state_token)
-        type_ids.append(torch.full((1,), len(cfg.camera_keys), device=state.device))
-
-        latent_tokens = self.latent_projection(latent).view(
-            batch_size, cfg.n_latent_tokens, cfg.d_model
-        )
-        tokens.append(latent_tokens)
-        type_ids.append(torch.full((cfg.n_latent_tokens,), len(cfg.camera_keys) + 1,
-                                   device=latent.device))
-
-        sequence = torch.cat(tokens, dim=1)
-        length = sequence.shape[1]
-        if length > self.position_embedding.shape[1]:
+        if latent.shape[-1] != cfg.latent_dim:
             raise ValueError(
-                f"sequence of {length} tokens exceeds the {self.position_embedding.shape[1]} "
-                "positional embeddings; reduce image resolution or backbone stages"
-            )
-        sequence = (sequence
-                    + self.position_embedding[:, :length]
-                    + self.token_type_embedding(torch.cat(type_ids).long()).unsqueeze(0))
+                f"latent has width {latent.shape[-1]}, expected {cfg.latent_dim} — "
+                "System 1 and System 2 must agree on latent_dim")
 
-        memory = self.encoder(sequence)
-        queries = self.action_queries.expand(batch_size, -1, -1)
-        decoded = self.decoder(queries, memory)
-        return self.action_head(decoded)
+        batch = {
+            OBS_IMAGES: [(images[key] - getattr(self, f"image_{key}_mean"))
+                         / getattr(self, f"image_{key}_std") for key in cfg.camera_keys],
+            OBS_STATE: (state - self.state_mean) / self.state_std,
+            LATENT_SLOT: latent,
+        }
+        if actions is None:
+            if cfg.use_vae and self.training:
+                raise ValueError(
+                    "the CVAE encoder needs the ground-truth action chunk in training "
+                    "mode; pass `actions` and `action_is_pad`, or call `.eval()` first "
+                    "if this is an inference pass")
+        else:
+            if action_is_pad is None:
+                raise ValueError("action_is_pad is required alongside actions: it masks "
+                                 "padded steps out of the CVAE encoder")
+            batch[ACTION] = self.normalise_action(actions)
+            batch["action_is_pad"] = action_is_pad
+        return self.act(batch)
 
     # ------------------------------------------------------------------- diagnostics
 
     def parameter_counts(self) -> dict[str, int]:
+        """Sizes by group.
+
+        `inference` excludes the CVAE encoder, which runs only during training — the
+        number that describes the deployed controller.
+        """
         groups = {
-            "backbone": self.backbone,
-            "encoder": self.encoder,
-            "decoder": self.decoder,
+            "backbone": self.act.backbone,
+            "encoder": self.act.encoder,
+            "decoder": self.act.decoder,
         }
         counts = {name: sum(p.numel() for p in module.parameters())
                   for name, module in groups.items()}
         counts["total"] = sum(p.numel() for p in self.parameters())
-        counts["other"] = counts["total"] - sum(counts[k] for k in groups)
+        vae = sum(p.numel() for name, p in self.named_parameters() if "vae_encoder" in name)
+        counts["vae_encoder"] = vae
+        counts["other"] = counts["total"] - sum(counts[k] for k in groups) - vae
+        counts["inference"] = counts["total"] - vae
         return counts
 
 
@@ -251,9 +326,11 @@ if __name__ == "__main__":
     model = System1(System1Config(pretrained_backbone=False))
     cfg = model.config
     counts = model.parameter_counts()
-    for name in ("backbone", "encoder", "decoder", "other", "total"):
-        print(f"{name:9s} {counts[name] / 1e6:6.1f}M")
+    for name in ("backbone", "encoder", "decoder", "vae_encoder", "other", "total", "inference"):
+        print(f"{name:12s} {counts[name] / 1e6:6.1f}M")
 
     images = {key: torch.rand(2, 3, 256, 256) for key in cfg.camera_keys}
-    actions = model(images, torch.rand(2, cfg.state_dim), torch.rand(2, cfg.latent_dim))
-    print(f"\naction chunk: {tuple(actions.shape)}")
+    model.eval()
+    actions, (mu, _) = model(images, torch.rand(2, cfg.state_dim),
+                             torch.rand(2, cfg.latent_dim))
+    print(f"\naction chunk: {tuple(actions.shape)}  style latent: {mu}")

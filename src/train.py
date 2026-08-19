@@ -57,12 +57,14 @@ class TrainConfig:
 
     # System 1 trains from scratch and wants a higher rate than the LoRA adapters
     # sitting on top of an already-good pretrained encoder.
-    lr_system1: float = 1e-4
+    lr_system1: float = 1e-5   # ACT's own rate for both its transformer and backbone
     lr_system2: float = 1e-5
     weight_decay: float = 1e-4
+    kl_weight: float = 10.0     # weight on the CVAE style latent's KLD term
     grad_clip: float = 1.0
 
-    chunk_size: int = 16
+    chunk_size: int = 100
+    # Δ₀ — the floor staleness of System 2's frame, modelling inference latency.
     temporal_offset: int = 2
     latent_dim: int = 512
 
@@ -205,6 +207,43 @@ def masked_l1_loss(
     return (error * valid).sum() / valid.expand_as(error).sum().clamp(min=1.0)
 
 
+def kld_loss(mu: torch.Tensor, log_sigma_x2: torch.Tensor) -> torch.Tensor:
+    """KL divergence of the CVAE style latent from a unit Gaussian, summed over dims.
+
+    Regularises the variable System 1's CVAE encoder infers from the ground-truth action
+    sequence. Without it the encoder is free to smuggle the whole chunk through the
+    style latent, which is available in training and zeroed at rollout — the policy
+    would fit the data and then behave differently the moment it was deployed.
+    """
+    return (-0.5 * (1 + log_sigma_x2 - mu.pow(2) - log_sigma_x2.exp())).sum(-1).mean()
+
+
+def action_loss(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    is_pad: torch.Tensor,
+    style_latent_params: tuple[torch.Tensor | None, torch.Tensor | None],
+    kl_weight: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """ACT's objective: masked L1 reconstruction plus the weighted KLD term.
+
+    Both operands are in normalised action space. Computing this on raw actions would
+    silently reweight the objective across dimensions — the rotation deltas vary by
+    roughly a tenth of what the gripper command does, so the two spaces disagree about
+    their relative importance by an order of magnitude.
+
+    Returns the scalar to backpropagate plus its components, which are logged
+    separately: a run where the KLD term dominates is a different failure from one where
+    reconstruction stalls, and their sum hides which happened.
+    """
+    l1 = masked_l1_loss(predicted, target, is_pad)
+    mu, log_sigma_x2 = style_latent_params
+    if mu is None:
+        return l1, {"l1": l1.item(), "kld": 0.0}
+    kld = kld_loss(mu, log_sigma_x2)
+    return l1 + kl_weight * kld, {"l1": l1.item(), "kld": kld.item()}
+
+
 # --------------------------------------------------------------------- optimiser
 
 
@@ -221,7 +260,28 @@ def build_optimizer(model: DualSystem, cfg: TrainConfig) -> torch.optim.Optimize
     )
 
 
-def build_model(cfg: TrainConfig) -> DualSystem:
+def system1_stats(dataset, cfg: TrainConfig):
+    """The normalisation statistics System 1 is trained against.
+
+    Taken from the dataset metadata rather than a sidecar file, so training and every
+    later evaluation read one source. `--tiny` skips them: its inputs are random tensors
+    whose statistics describe nothing.
+    """
+    if cfg.tiny:
+        return None
+    from src.models.system1 import NormalisationStats
+
+    config = System1Config(latent_dim=cfg.latent_dim, chunk_size=cfg.chunk_size)
+    return NormalisationStats.from_dataset(dataset.meta, config)
+
+
+def build_model(cfg: TrainConfig, stats=None) -> DualSystem:
+    """Assemble the model, optionally with the dataset's normalisation statistics.
+
+    `stats` is omitted when restoring a checkpoint: the statistics are persistent
+    buffers, so a strict `load_state_dict` supplies them, and reading them from a
+    dataset that may not be the one the run trained on would be the wrong source.
+    """
     if cfg.tiny:
         from src.models.dual_system import tiny_config
         from src.models.system1 import tiny_config as system1_tiny
@@ -232,13 +292,13 @@ def build_model(cfg: TrainConfig) -> DualSystem:
         # that many regardless of what the tiny defaults say.
         config.system1 = system1_tiny(latent_dim=config.system2.latent_dim,
                                       chunk_size=cfg.chunk_size)
-        return DualSystem(config)
+        return DualSystem(config, system1_stats=stats)
     return DualSystem(DualSystemConfig(
         system2=System2Config(latent_dim=cfg.latent_dim),
         system1=System1Config(latent_dim=cfg.latent_dim, chunk_size=cfg.chunk_size),
         conditioning=Conditioning(cfg.conditioning),
         temporal_offset=cfg.temporal_offset,
-    ))
+    ), system1_stats=stats)
 
 
 # ---------------------------------------------------------------------- metrics
@@ -285,15 +345,19 @@ class MetricsLog:
                 "is_best": is_best,
             }) + "\n")
 
-    def log(self, step: int, loss: float, rate: float, elapsed: float) -> None:
+    def log(self, step: int, loss: float, rate: float, elapsed: float,
+            kld: float | None = None) -> None:
+        record = {
+            "type": "step",
+            "step": step,
+            "loss": round(loss, 6),
+            "it_per_s": round(rate, 3),
+            "elapsed_s": round(elapsed, 1),
+        }
+        if kld is not None:
+            record["kld"] = round(kld, 6)
         with self.path.open("a") as handle:
-            handle.write(json.dumps({
-                "type": "step",
-                "step": step,
-                "loss": round(loss, 6),
-                "it_per_s": round(rate, 3),
-                "elapsed_s": round(elapsed, 1),
-            }) + "\n")
+            handle.write(json.dumps(record) + "\n")
 
 
 def validation_subset(dataset, max_samples: int):
@@ -324,9 +388,13 @@ def validate(model: DualSystem, loader, device: torch.device) -> float:
             observation = observation.to(device)
             actions, is_pad = actions.to(device), is_pad.to(device)
             system2_frames = [frame.to(device) for frame in system2_frames]
-            predicted, _latent = model(observation.images, observation.state,
-                                       system2_frames, instructions)
-            total += masked_l1_loss(predicted, actions, is_pad).item()
+            # `eval()` above zeroes the CVAE style latent, so validation measures the
+            # reconstruction the deployed policy is actually capable of — the KLD term
+            # has no counterpart here and the L1 is directly comparable to training's.
+            predicted, _latent, _style = model(observation.images, observation.state,
+                                               system2_frames, instructions)
+            total += masked_l1_loss(predicted, model.system1.normalise_action(actions),
+                                    is_pad).item()
             batches += 1
     finally:
         model.train(was_training)
@@ -356,7 +424,7 @@ def train(cfg: TrainConfig) -> Path:
             pin_memory=device.type == "cuda", drop_last=False,
         )
 
-    model = build_model(cfg).to(device)
+    model = build_model(cfg, stats=system1_stats(dataset, cfg)).to(device)
     optimizer = build_optimizer(model, cfg)
     counts = model.parameter_counts()
 
@@ -377,7 +445,10 @@ def train(cfg: TrainConfig) -> Path:
 
     model.train()
     step, started = 0, time.time()
+    # Reconstruction and KLD are accumulated apart: their sum hides whether a stalled
+    # run is failing to fit the actions or being dominated by the regulariser.
     running = 0.0
+    running_kld = 0.0
     last_log_at = started
     best_val = float("inf")
     while step < cfg.steps:
@@ -389,9 +460,12 @@ def train(cfg: TrainConfig) -> Path:
             actions, is_pad = actions.to(device), is_pad.to(device)
             system2_frames = [f.to(device) for f in system2_frames]
 
-            predicted, _latent = model(observation.images, observation.state,
-                                       system2_frames, instructions)
-            loss = masked_l1_loss(predicted, actions, is_pad)
+            predicted, _latent, style_latent = model(
+                observation.images, observation.state, system2_frames, instructions,
+                actions=actions, action_is_pad=is_pad)
+            loss, components = action_loss(
+                predicted, model.system1.normalise_action(actions), is_pad,
+                style_latent, cfg.kl_weight)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -399,7 +473,8 @@ def train(cfg: TrainConfig) -> Path:
                                      cfg.grad_clip)
             optimizer.step()
 
-            running += loss.item()
+            running += components["l1"]
+            running_kld += components["kld"]
             step += 1
 
             if step % cfg.log_every == 0:
@@ -408,9 +483,12 @@ def train(cfg: TrainConfig) -> Path:
                 # a run that slows down should be visible while it happens.
                 rate = cfg.log_every / max(now - last_log_at, 1e-9)
                 mean_loss = running / cfg.log_every
-                print(f"step {step:>7d} | train {mean_loss:.4f} | {rate:.2f} it/s")
-                metrics.log(step, mean_loss, rate, now - started)
+                mean_kld = running_kld / cfg.log_every
+                print(f"step {step:>7d} | l1 {mean_loss:.4f} | kld {mean_kld:.4f} "
+                      f"| {rate:.2f} it/s")
+                metrics.log(step, mean_loss, rate, now - started, kld=mean_kld)
                 running = 0.0
+                running_kld = 0.0
                 last_log_at = now
             if val_loader is not None and step % cfg.val_every == 0:
                 val_loss = validate(model, val_loader, device)
@@ -459,7 +537,10 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--lr-system1", type=float, default=1e-4)
     p.add_argument("--lr-system2", type=float, default=1e-5)
     p.add_argument("--chunk-size", type=int, default=16)
-    p.add_argument("--temporal-offset", type=int, default=2)
+    p.add_argument("--kl-weight", type=float, default=TrainConfig.kl_weight,
+                   help="weight on the KLD term regularising the CVAE style latent")
+    p.add_argument("--temporal-offset", type=int, default=2,
+                   help="Δ₀: floor staleness of System 2's frame, in env steps")
     p.add_argument("--device", default=TrainConfig.device)
     p.add_argument("--task-indices", type=int, nargs="+", default=None,
                    help="restrict to these dataset task indices (default: all ten)")

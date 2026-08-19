@@ -120,7 +120,7 @@ def test_action_is_clipped_before_env_step():
     env = _SpyEnv()
     cfg = _cfg(horizon=3)
     with torch.no_grad():
-        for p in model.system1.action_head.parameters():
+        for p in model.system1.act.action_head.parameters():
             p.mul_(100.0)   # force out-of-range predictions
     _run(model, env, cfg)
     assert env.step_actions   # sanity: the loop actually ran

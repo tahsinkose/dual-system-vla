@@ -276,7 +276,7 @@ def test_validation_restores_training_mode():
         "action_is_pad": torch.zeros(1, 4, dtype=torch.bool),
         "task": ["do the thing"],
     }
-    loss = validate(model, [batch], torch.device("cpu"), max_batches=1)
+    loss = validate(model, [batch], torch.device("cpu"))
     assert loss >= 0.0
     assert model.training, "validate() left the model in eval mode"
 
@@ -296,5 +296,36 @@ def test_validation_runs_without_gradients():
         "task": ["do the thing"],
     }
     model.zero_grad(set_to_none=True)
-    validate(model, [batch], torch.device("cpu"), max_batches=1)
+    validate(model, [batch], torch.device("cpu"))
     assert all(p.grad is None for p in model.parameters() if p.requires_grad)
+
+
+def test_validation_subset_spans_every_task():
+    """Bounding validation by "first N batches" silently narrows it to one or two tasks.
+
+    Samples are ordered by episode, so a prefix of the validation set covers only the
+    earliest tasks — `best.pt` would then be selected on a fraction of the benchmark.
+    A stride keeps the cost bounded while covering all of them.
+    """
+    from src.train import validation_subset
+
+    # Stand-in for the ordered validation set: 10 tasks, 100 contiguous samples each.
+    ordered = [t for t in range(10) for _ in range(100)]
+    subset = validation_subset(ordered, max_samples=50)
+    assert len(set(subset)) == 10, f"subset covers only tasks {sorted(set(subset))}"
+    assert len(subset) <= 50
+
+
+def test_validation_subset_is_fixed_across_calls():
+    """Successive losses must differ because the model changed, not the sample."""
+    from src.train import validation_subset
+
+    ordered = list(range(1000))
+    assert list(validation_subset(ordered, 40)) == list(validation_subset(ordered, 40))
+
+
+def test_validation_subset_passes_small_sets_through():
+    from src.train import validation_subset
+
+    small = list(range(10))
+    assert validation_subset(small, 50) is small

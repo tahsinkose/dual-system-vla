@@ -70,7 +70,7 @@ class TrainConfig:
     checkpoint_every: int = 5_000
     val_fraction: float = 0.1     # per task; 0 disables validation entirely
     val_every: int = 1_000        # steps between validation passes
-    val_batches: int = 25         # batches per pass, bounding its cost
+    val_samples: int = 512        # bounds cost; spread across every task
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Restrict to these dataset task indices; None means all ten.
@@ -296,8 +296,19 @@ class MetricsLog:
             }) + "\n")
 
 
+def validation_subset(dataset, max_samples: int):
+    """A fixed subset that spans every task,.
+    """
+    from torch.utils.data import Subset
+
+    if max_samples >= len(dataset):
+        return dataset
+    stride = max(1, len(dataset) // max_samples)
+    return Subset(dataset, list(range(0, len(dataset), stride))[:max_samples])
+
+
 @torch.no_grad()
-def validate(model: DualSystem, loader, device: torch.device, max_batches: int) -> float:
+def validate(model: DualSystem, loader, device: torch.device) -> float:
     """Mean masked L1 over held-out episodes.
 
     Switches to eval mode and restores training mode afterwards — forgetting the
@@ -309,8 +320,6 @@ def validate(model: DualSystem, loader, device: torch.device, max_batches: int) 
     total, batches = 0.0, 0
     try:
         for batch in loader:
-            if batches >= max_batches:
-                break
             observation, system2_frames, actions, is_pad, instructions = split_batch(batch)
             observation = observation.to(device)
             actions, is_pad = actions.to(device), is_pad.to(device)
@@ -339,9 +348,10 @@ def train(cfg: TrainConfig) -> Path:
     val_loader = None
     if val_dataset is not None:
         val_loader = torch.utils.data.DataLoader(
-            # Not shuffled: the same batches every pass, so successive validation
-            # losses differ because the model changed, not because the sample did.
-            val_dataset, batch_size=cfg.batch_size, shuffle=False,
+            # Fixed, task-spanning subset; not shuffled, so successive validation losses
+            # differ because the model changed, not because the sample did.
+            validation_subset(val_dataset, cfg.val_samples),
+            batch_size=cfg.batch_size, shuffle=False,
             num_workers=max(1, cfg.num_workers // 2),
             pin_memory=device.type == "cuda", drop_last=False,
         )
@@ -403,7 +413,7 @@ def train(cfg: TrainConfig) -> Path:
                 running = 0.0
                 last_log_at = now
             if val_loader is not None and step % cfg.val_every == 0:
-                val_loss = validate(model, val_loader, device, cfg.val_batches)
+                val_loss = validate(model, val_loader, device)
                 improved = val_loss < best_val
                 marker = "  <- best" if improved else ""
                 print(f"step {step:>7d} | val {val_loss:.4f}{marker}")
@@ -463,7 +473,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
                         "reveal overfitting — the success metric comes from simulator "
                         "rollouts against LIBERO's own initial states")
     p.add_argument("--val-every", type=int, default=1000, help="steps between validation passes")
-    p.add_argument("--val-batches", type=int, default=25, help="batches per validation pass")
+    p.add_argument("--val-samples", type=int, default=512,
+                   help="validation samples per pass, strided across every task")
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--checkpoint-every", type=int, default=5_000)
     args = p.parse_args(argv)

@@ -30,7 +30,8 @@ from src.models.dual_system import Conditioning, DualSystem, tiny_config  # noqa
 
 from eval.logging import EpisodeResult  # noqa: E402
 from eval.perturbations import PerturbationKind, PerturbationSpec, TriggerCondition  # noqa: E402
-from eval.run_eval import EvalConfig, TemporalOffsetBuffer, resolve_episodes, run_episode  # noqa: E402
+from eval.run_eval import EvalConfig, TemporalOffsetBuffer, run_episode  # noqa: E402
+from eval.trials import InitSource, build_trials  # noqa: E402
 from _fake_env import FakeLiberoEnv  # noqa: E402
 
 INSTRUCTION = "put both the alphabet soup and the tomato sauce in the basket"
@@ -84,8 +85,7 @@ def _trial(index=0, init_state=None):
 def _run(model, env, cfg, spec=None, conditioning=None):
     spec = spec or _spec()
     conditioning = conditioning or Conditioning.LIVE
-    return run_episode(model, env, episode_index=0, instruction=INSTRUCTION,
-                       task_dataset_index=0, eval_conditioning=conditioning,
+    return run_episode(model, env, _trial(), eval_conditioning=conditioning,
                        trained_conditioning=Conditioning.LIVE, perturbation=spec,
                        cfg=cfg, checkpoint_path="unused", device=torch.device("cpu"))
 
@@ -371,32 +371,43 @@ class _FakeMapping:
     def dataset_indices(self):
         return [0]
 
+    def by_dataset_index(self, index):
+        return _FakeTask()
 
-def test_resolve_episodes_skips_unmatched_by_default_and_keeps_order(monkeypatch):
-    monkeypatch.setattr("eval.run_eval.episodes_for_task", lambda dataset, t: [5, 3, 1])
+    def by_episode(self, dataset, episode_index):
+        return _FakeTask()
+
+
+def test_demo_trials_skip_unmatched_by_default_and_keep_order(monkeypatch):
+    """Episodes without a recovered initial state would start from a different object
+    layout than the demonstration, so they are dropped rather than silently run."""
+    monkeypatch.setattr("src.utils.episodes_for_task", lambda dataset, t: [5, 3, 1])
     matched = {1, 5}
-    monkeypatch.setattr("eval.run_eval.load_exact_init_state",
+    monkeypatch.setattr("src.utils.load_exact_init_state",
                         lambda e: object() if e in matched else None)
+    monkeypatch.setattr("src.utils.load_episode", lambda dataset, e: ("do the thing", None, None))
 
-    cfg = _cfg(task_indices=[0], allow_unmatched_episodes=False)
-    resolved = resolve_episodes(cfg, dataset=None, mapping=_FakeMapping())
-    assert resolved == [1, 5]
-
-
-def test_resolve_episodes_allow_unmatched_keeps_everything(monkeypatch):
-    monkeypatch.setattr("eval.run_eval.episodes_for_task", lambda dataset, t: [5, 3, 1])
-    monkeypatch.setattr("eval.run_eval.load_exact_init_state", lambda e: None)
-
-    cfg = _cfg(task_indices=[0], allow_unmatched_episodes=True)
-    resolved = resolve_episodes(cfg, dataset=None, mapping=_FakeMapping())
-    assert resolved == [1, 3, 5]
+    trials = build_trials(_FakeMapping(), None, InitSource.DEMO, task_indices=[0])
+    assert [t.index for t in trials] == [1, 5]
 
 
-def test_resolve_episodes_explicit_episodes_wins_over_task_indices(monkeypatch):
-    monkeypatch.setattr("eval.run_eval.load_exact_init_state", lambda e: object())
-    cfg = _cfg(task_indices=[0], episodes=[9, 2])
-    resolved = resolve_episodes(cfg, dataset=None, mapping=_FakeMapping())
-    assert resolved == [2, 9]
+def test_demo_trials_allow_unmatched_keeps_everything(monkeypatch):
+    monkeypatch.setattr("src.utils.episodes_for_task", lambda dataset, t: [5, 3, 1])
+    monkeypatch.setattr("src.utils.load_exact_init_state", lambda e: None)
+    monkeypatch.setattr("src.utils.load_episode", lambda dataset, e: ("do the thing", None, None))
+
+    trials = build_trials(_FakeMapping(), None, InitSource.DEMO, task_indices=[0],
+                          allow_unmatched=True)
+    assert [t.index for t in trials] == [1, 3, 5]
+
+
+def test_demo_trials_explicit_episodes_win_over_task_indices(monkeypatch):
+    monkeypatch.setattr("src.utils.load_exact_init_state", lambda e: object())
+    monkeypatch.setattr("src.utils.load_episode", lambda dataset, e: ("do the thing", None, None))
+
+    trials = build_trials(_FakeMapping(), None, InitSource.DEMO, task_indices=[0],
+                          episodes=[9, 2])
+    assert [t.index for t in trials] == [2, 9]
 
 
 # ------------------------------------------------------------------- EvalConfig

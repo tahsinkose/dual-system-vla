@@ -144,8 +144,16 @@ def subtask_breakdown(results: list[EpisodeResult]) -> str:
         width = max(len(s["description"]) for r in group for s in r.subtasks)
         for position in range(max(len(r.subtasks) for r in group)):
             steps = [r.subtasks[position] for r in group if position < len(r.subtasks)]
-            achieved = sum(s["first_achieved_step"] is not None for s in steps)
-            note = "  (satisfied at reset)" if all(s["achieved_at_reset"] for s in steps) else ""
-            lines.append(f"    {steps[0]['description']:<{width}}  "
-                         f"{achieved:>3d}/{len(steps):<3d}{note}")
+            description = steps[0]["description"]
+            if all(s["achieved_at_reset"] for s in steps):
+                # Already true before the first action, so it is excluded from the
+                # score and there is no completion count to report. What can still go
+                # wrong is the policy undoing it — a rollout that knocks the stove off
+                # fails the task — so report how many trials ended with it intact.
+                held = sum(s["achieved_at_end"] for s in steps)
+                lines.append(f"    {description:<{width}}  {held:>3d}/{len(steps):<3d} "
+                             "still held at end (true at reset, not scored)")
+            else:
+                achieved = sum(s["first_achieved_step"] is not None for s in steps)
+                lines.append(f"    {description:<{width}}  {achieved:>3d}/{len(steps):<3d}")
     return "\n".join(lines)

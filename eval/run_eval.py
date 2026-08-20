@@ -201,6 +201,7 @@ def run_episode(
     cfg: EvalConfig,
     checkpoint_path: str,
     device: torch.device,
+    checkpoint_step: int | None = None,
 ) -> EpisodeResult:
     """Run one episode start to finish, writing its own video/latent-trace artifacts
     (if requested) before returning.
@@ -330,6 +331,15 @@ def run_episode(
         latent_cosine_distance=cosine_distance, recovered=recovered, steps_to_recovery=steps_to_recovery,
         subtasks=tracker.as_dicts(), subtasks_achieved=tracker.n_achieved,
         subtasks_total=tracker.n_total,
+        horizon=cfg.horizon, init_source=cfg.init_source,
+        trials_per_task=cfg.trials_per_task,
+        system1_arch=model.config.system1_arch,
+        latent_update_period=model.config.latent_update_period,
+        temporal_offset=model.config.temporal_offset,
+        perturb_at_step=cfg.perturb_at_step,
+        displacement_radius_m=(cfg.displacement_radius_m
+                               if perturbation.kind is not PerturbationKind.NONE else None),
+        checkpoint_step=checkpoint_step,
         video_path=str(video.path) if video is not None else None,
         latent_trace_path=str(latent_trace_path) if latent_trace_path else None,
     )
@@ -376,7 +386,8 @@ def main(cfg: EvalConfig) -> list[EpisodeResult]:
                               # and perturbation.episode_seed, not the env seed
                 result = run_episode(loaded.model, env, trial, eval_conditioning,
                                      loaded.trained_conditioning, spec, cfg,
-                                     str(loaded.checkpoint_path), device)
+                                     str(loaded.checkpoint_path), device,
+                                     checkpoint_step=loaded.step)
             finally:
                 env.close()
             writer.write(result)

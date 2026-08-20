@@ -57,6 +57,22 @@ class EpisodeResult:
     subtasks_achieved: int = 0
     subtasks_total: int = 0
 
+    # Provenance — what this row was measured under. Every field has a default, so logs
+    # written before they existed still parse. They exist because the matrix is compared
+    # *across* files: two rows that differ in horizon or initial-state source are not
+    # comparable, and without recording it there is nothing to detect that with. The gate
+    # scores at horizon 800 while the harness defaults to 600, so this is the most likely
+    # way for the matrix to be silently wrong.
+    horizon: int | None = None
+    init_source: str | None = None
+    trials_per_task: int | None = None
+    system1_arch: str | None = None
+    latent_update_period: int | None = None   # K, environment steps per latent refresh
+    temporal_offset: int | None = None        # the frame age System 2 is fed
+    perturb_at_step: int | None = None        # the configured trigger, not when it fired
+    displacement_radius_m: float | None = None
+    checkpoint_step: int | None = None
+
     # artifacts
     video_path: str | None = None
     latent_trace_path: str | None = None   # only set when --latent-trace was passed

@@ -7,6 +7,7 @@ readable prefix of results.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from dataclasses import asdict, dataclass, field
@@ -79,6 +80,36 @@ class JsonlResultWriter:
 
     def close(self) -> None:
         self._file.close()
+
+
+def read_results(path: Path) -> list[EpisodeResult]:
+    """Parse a JSONL log back into `EpisodeResult`s.
+
+    Unknown keys are dropped rather than raising, so a log written by an older or newer
+    harness still reads; a *missing* key raises, since a summary computed over a
+    defaulted `success` or `steps_run` would be quietly wrong rather than absent.
+    """
+    fields = {f.name for f in dataclasses.fields(EpisodeResult)}
+    required = {f.name for f in dataclasses.fields(EpisodeResult)
+                if f.default is dataclasses.MISSING
+                and f.default_factory is dataclasses.MISSING}
+
+    results = []
+    with Path(path).open() as handle:
+        for number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"{path}:{number}: not valid JSON — {error}") from error
+            missing = required - record.keys()
+            if missing:
+                raise ValueError(f"{path}:{number}: missing required field(s) "
+                                 f"{sorted(missing)}")
+            results.append(EpisodeResult(**{k: v for k, v in record.items() if k in fields}))
+    return results
 
 
 def write_latent_trace(path: Path, latents: np.ndarray, steps_since_update: np.ndarray) -> None:

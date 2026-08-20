@@ -12,12 +12,14 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from eval.logging import (  # noqa: E402
     EpisodeResult,
     JsonlResultWriter,
+    read_results,
     subtask_breakdown,
     summarize,
     write_latent_trace,
@@ -161,15 +163,88 @@ def test_breakdown_groups_by_task():
     assert "task 05  second task" in breakdown
 
 
-def test_breakdown_marks_conditions_already_true_at_reset():
-    """The stove in KITCHEN_SCENE8 is on before the policy acts; a bare 10/10 there
-    would read as progress the policy did not make."""
-    result = _result(subtasks=[
-        _subtask("turnon:stove_1", "keep the stove on", first_achieved_step=0,
-                 achieved_at_reset=True, achieved_at_end=True),
-    ], subtasks_achieved=1, subtasks_total=1)
-    assert "(satisfied at reset)" in subtask_breakdown([result])
+def _stove(achieved_at_end: bool) -> dict:
+    """KITCHEN_SCENE8's stove: on before the policy acts, and it can be knocked off."""
+    return _subtask("turnon:stove_1", "keep the stove on", first_achieved_step=0,
+                    achieved_at_reset=True, achieved_at_end=achieved_at_end)
+
+
+def test_breakdown_reports_survival_not_completion_for_reset_conditions():
+    """A completion count is meaningless for something true before the first action.
+
+    What can still go wrong is the policy undoing it, so the count reports how many
+    trials ended with the condition intact.
+    """
+    results = [_result(subtasks=[_stove(achieved_at_end=end)], subtasks_total=0)
+               for end in (True, True, False)]
+    breakdown = subtask_breakdown(results)
+    assert "2/3" in breakdown              # two trials left the stove on
+    assert "still held at end" in breakdown
+    assert "not scored" in breakdown
+
+
+def test_breakdown_does_not_credit_a_reset_condition_as_completed():
+    """The old form counted the step-0 latch and printed a full 3/3."""
+    results = [_result(subtasks=[_stove(achieved_at_end=False)], subtasks_total=0)
+               for _ in range(3)]
+    assert "3/3" not in subtask_breakdown(results)
 
 
 def test_summarize_includes_the_breakdown():
     assert "subtask completion" in summarize([_two_step_result(placed=True)])
+
+
+# --------------------------------------------------------------------- reading back
+
+
+def test_read_results_round_trips_everything_the_writer_wrote(tmp_path):
+    path = tmp_path / "results.jsonl"
+    writer = JsonlResultWriter(path)
+    written = [
+        _result(episode_index=0, subtasks=[_subtask("a", "pick it up", first_achieved_step=3)]),
+        _result(episode_index=1, success=False, steps_to_success=None, steps_run=800),
+    ]
+    for result in written:
+        writer.write(result)
+    writer.close()
+
+    assert read_results(path) == written
+
+
+def test_read_results_ignores_blank_lines(tmp_path):
+    path = tmp_path / "results.jsonl"
+    path.write_text(_result().to_json_line() + "\n\n" + _result(episode_index=1).to_json_line() + "\n")
+    assert len(read_results(path)) == 2
+
+
+def test_read_results_drops_unknown_fields(tmp_path):
+    """A log from a harness that recorded something extra must still read."""
+    path = tmp_path / "results.jsonl"
+    record = json.loads(_result().to_json_line())
+    record["some_future_metric"] = 1.5
+    path.write_text(json.dumps(record) + "\n")
+
+    assert read_results(path)[0].episode_index == 0
+
+
+def test_read_results_raises_on_a_missing_required_field(tmp_path):
+    """Defaulting `success` or `steps_run` would make the summary quietly wrong.
+
+    A dropped optional field costs nothing; a dropped required one changes the number
+    the summary reports, so it has to raise rather than fall back.
+    """
+    path = tmp_path / "results.jsonl"
+    record = json.loads(_result().to_json_line())
+    del record["success"]
+    path.write_text(json.dumps(record) + "\n")
+
+    with pytest.raises(ValueError, match="missing required field"):
+        read_results(path)
+
+
+def test_read_results_names_the_line_that_is_not_json(tmp_path):
+    path = tmp_path / "results.jsonl"
+    path.write_text(_result().to_json_line() + "\nnot json at all\n")
+
+    with pytest.raises(ValueError, match=r"results\.jsonl:2"):
+        read_results(path)

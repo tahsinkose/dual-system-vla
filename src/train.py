@@ -32,12 +32,24 @@ from src.env_setup import setup_env  # noqa: E402
 
 setup_env()
 
-from src.models.dual_system import Conditioning, DualSystem, DualSystemConfig  # noqa: E402
+from src.models.dual_system import (  # noqa: E402
+    SYSTEM1_ARCHS,
+    Conditioning,
+    DualSystem,
+    DualSystemConfig,
+)
 from src.models.system1 import System1Config  # noqa: E402
+from src.models.system1_scratch import ScratchSystem1Config  # noqa: E402
 from src.models.system2 import System2Config  # noqa: E402
 from src.observations import ModelObservation  # noqa: E402
 
 REPO_ID = "lerobot/libero_10"
+
+# Each System 1 carries its own action-chunk length, and they differ: ACT predicts 100
+# steps, the scratch encoder-decoder 16. `TrainConfig` defers to whichever is selected,
+# so neither runs off-design because the other's number was left in place.
+DEFAULT_CHUNK_SIZE = {"act": System1Config.chunk_size,
+                      "scratch": ScratchSystem1Config.chunk_size}
 
 # The dataset stores System 1's cameras under these names; the wrist camera is renamed
 # to the canonical key by the observation adapter.
@@ -63,7 +75,12 @@ class TrainConfig:
     kl_weight: float = 10.0     # weight on the CVAE style latent's KLD term
     grad_clip: float = 1.0
 
-    chunk_size: int = 100
+    # Which System 1 to build: "act" wraps LeRobot's ACT, "scratch" the from-scratch
+    # encoder-decoder in src/models/system1_scratch.py.
+    system1_arch: str = "act"
+
+    # None resolves to the selected architecture's default; see DEFAULT_CHUNK_SIZE.
+    chunk_size: int | None = None
     # Δ₀ — the floor staleness of System 2's frame, modelling inference latency.
     temporal_offset: int = 2
     latent_dim: int = 512
@@ -83,6 +100,13 @@ class TrainConfig:
     # §1 training gate — loss must fall, gradients must reach System 2.
     overfit_episodes: int | None = None
     tiny: bool = False   # small random models, for testing the loop itself
+
+    def __post_init__(self) -> None:
+        if self.system1_arch not in SYSTEM1_ARCHS:
+            raise ValueError(f"system1_arch must be one of {SYSTEM1_ARCHS}, "
+                             f"got {self.system1_arch!r}")
+        if self.chunk_size is None:
+            self.chunk_size = DEFAULT_CHUNK_SIZE[self.system1_arch]
 
 
 # ------------------------------------------------------------------------- data
@@ -283,7 +307,8 @@ def system1_stats(dataset, cfg: TrainConfig):
     later evaluation read one source. `--tiny` skips them: its inputs are random tensors
     whose statistics describe nothing.
     """
-    if cfg.tiny:
+    if cfg.tiny or cfg.system1_arch != "act":
+        # The scratch architecture trains on raw actions and holds no statistics.
         return None
     from src.models.system1 import NormalisationStats
 
@@ -300,18 +325,25 @@ def build_model(cfg: TrainConfig, stats=None) -> DualSystem:
     """
     if cfg.tiny:
         from src.models.dual_system import tiny_config
-        from src.models.system1 import tiny_config as system1_tiny
+        if cfg.system1_arch == "act":
+            from src.models.system1 import tiny_config as system1_tiny
+        else:
+            from src.models.system1_scratch import tiny_config as system1_tiny
 
         config = tiny_config(conditioning=Conditioning(cfg.conditioning),
-                             temporal_offset=cfg.temporal_offset)
+                             temporal_offset=cfg.temporal_offset,
+                             system1_arch=cfg.system1_arch)
         # The dataset hands back chunks of cfg.chunk_size, so the model must predict
         # that many regardless of what the tiny defaults say.
         config.system1 = system1_tiny(latent_dim=config.system2.latent_dim,
                                       chunk_size=cfg.chunk_size)
         return DualSystem(config, system1_stats=stats)
+    system1_config = (System1Config if cfg.system1_arch == "act" else ScratchSystem1Config)(
+        latent_dim=cfg.latent_dim, chunk_size=cfg.chunk_size)
     return DualSystem(DualSystemConfig(
         system2=System2Config(latent_dim=cfg.latent_dim),
-        system1=System1Config(latent_dim=cfg.latent_dim, chunk_size=cfg.chunk_size),
+        system1=system1_config,
+        system1_arch=cfg.system1_arch,
         conditioning=Conditioning(cfg.conditioning),
         temporal_offset=cfg.temporal_offset,
     ), system1_stats=stats)
@@ -555,19 +587,27 @@ def save_checkpoint(model: DualSystem, cfg: TrainConfig, step: int, output_dir: 
 def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--conditioning", default="live", choices=["live", "static"],
+    p.add_argument("--conditioning", default=TrainConfig.conditioning,
+                   choices=["live", "static"],
                    help="'live' produces CKPT-DUAL, 'static' the naive-baseline CKPT-STATIC")
-    p.add_argument("--output-dir", type=Path, default=Path("outputs/train"))
-    p.add_argument("--steps", type=int, default=100_000)
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--num-workers", type=int, default=8)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--lr-system1", type=float, default=1e-4)
-    p.add_argument("--lr-system2", type=float, default=1e-5)
-    p.add_argument("--chunk-size", type=int, default=16)
+    p.add_argument("--output-dir", type=Path, default=TrainConfig.output_dir)
+    p.add_argument("--steps", type=int, default=TrainConfig.steps)
+    p.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
+    p.add_argument("--num-workers", type=int, default=TrainConfig.num_workers)
+    p.add_argument("--seed", type=int, default=TrainConfig.seed)
+    p.add_argument("--lr-system1", type=float, default=TrainConfig.lr_system1)
+    p.add_argument("--lr-system2", type=float, default=TrainConfig.lr_system2)
+    p.add_argument("--system1-arch", default=TrainConfig.system1_arch,
+                   choices=list(SYSTEM1_ARCHS),
+                   help="System 1 implementation: 'act' wraps LeRobot's ACT (default), "
+                        "'scratch' uses the from-scratch encoder-decoder")
+    p.add_argument("--chunk-size", type=int, default=None,
+                   help="actions predicted per forward pass; defaults to the value the "
+                        "selected --system1-arch was designed around ("
+                        + ", ".join(f"{a}={n}" for a, n in DEFAULT_CHUNK_SIZE.items()) + ")")
     p.add_argument("--kl-weight", type=float, default=TrainConfig.kl_weight,
                    help="weight on the KLD term regularising the CVAE style latent")
-    p.add_argument("--temporal-offset", type=int, default=2,
+    p.add_argument("--temporal-offset", type=int, default=TrainConfig.temporal_offset,
                    help="Δ₀: floor staleness of System 2's frame, in env steps")
     p.add_argument("--device", default=TrainConfig.device)
     p.add_argument("--task-indices", type=int, nargs="+", default=None,
@@ -576,19 +616,19 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
                    help="overfit this many episodes — the §1 training smoke-test gate")
     p.add_argument("--tiny", action="store_true",
                    help="small random models, for exercising the loop itself")
-    p.add_argument("--val-fraction", type=float, default=0.1,
+    p.add_argument("--val-fraction", type=float, default=TrainConfig.val_fraction,
                    help="fraction of each task's episodes held out from training and "
                         "scored (default: 0.1). At 0 every episode trains and the "
                         "scoring pass runs in-sample: best.pt is still written, but the "
                         "loss says nothing about generalisation. Either way the success "
                         "metric comes from simulator rollouts against LIBERO's own "
                         "initial states")
-    p.add_argument("--val-every", type=int, default=1000,
+    p.add_argument("--val-every", type=int, default=TrainConfig.val_every,
                    help="steps between scoring passes; 0 disables them and best.pt")
-    p.add_argument("--val-samples", type=int, default=512,
+    p.add_argument("--val-samples", type=int, default=TrainConfig.val_samples,
                    help="validation samples per pass, strided across every task")
-    p.add_argument("--log-every", type=int, default=100)
-    p.add_argument("--checkpoint-every", type=int, default=5_000)
+    p.add_argument("--log-every", type=int, default=TrainConfig.log_every)
+    p.add_argument("--checkpoint-every", type=int, default=TrainConfig.checkpoint_every)
     args = p.parse_args(argv)
     return TrainConfig(**vars(args))
 

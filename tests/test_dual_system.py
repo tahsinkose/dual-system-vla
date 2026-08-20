@@ -208,3 +208,50 @@ def test_act_does_not_build_a_graph(model):
     images, state, s2_images, instructions = observation(model)
     actions, latent = model.act(images, state, s2_images, instructions)
     assert not actions.requires_grad and not latent.requires_grad
+
+
+# ------------------------------------------------------------- System 1 architecture
+
+
+def test_both_system1_architectures_build_and_share_one_contract():
+    """`DualSystem` must not branch on which System 1 it holds.
+
+    Both return an action chunk plus a style-latent pair; the scratch path has no CVAE
+    and returns `(None, None)`, which is what makes the KLD term inert without the
+    caller inspecting the architecture.
+    """
+    import torch
+
+    from src.models.dual_system import DualSystem, tiny_config
+    from src.models.system1 import System1
+    from src.models.system1_scratch import ScratchSystem1
+
+    for arch, expected in (("act", System1), ("scratch", ScratchSystem1)):
+        model = DualSystem(tiny_config(system1_arch=arch))
+        assert isinstance(model.system1, expected)
+        cfg = model.config.system1
+        images = {key: torch.rand(2, 3, 256, 256) for key in cfg.camera_keys}
+        actions, style = model.system1(images, torch.rand(2, cfg.state_dim),
+                                       torch.rand(2, cfg.latent_dim),
+                                       actions=torch.rand(2, cfg.chunk_size, cfg.action_dim),
+                                       action_is_pad=torch.zeros(2, cfg.chunk_size, dtype=torch.bool))
+        assert actions.shape == (2, cfg.chunk_size, cfg.action_dim)
+        assert len(style) == 2
+        if arch == "scratch":
+            assert style == (None, None)
+
+
+def test_unknown_system1_arch_is_rejected():
+    from src.models.dual_system import tiny_config
+
+    with pytest.raises(ValueError, match="system1_arch"):
+        tiny_config(system1_arch="lstm")
+
+
+def test_arch_and_config_type_must_agree():
+    """A mismatched pair would build the wrong network from the right-looking config."""
+    from src.models.dual_system import DualSystemConfig
+    from src.models.system1_scratch import ScratchSystem1Config
+
+    with pytest.raises(TypeError, match="system1_arch"):
+        DualSystemConfig(system1=ScratchSystem1Config(), system1_arch="act")

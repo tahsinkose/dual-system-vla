@@ -423,3 +423,35 @@ def test_validation_subset_passes_small_sets_through():
 
     small = list(range(10))
     assert validation_subset(small, 50) is small
+
+
+def test_cli_defaults_match_the_dataclass():
+    """`parse_args()` and `TrainConfig()` must describe the same run.
+
+    They drifted once: the CLI kept `--lr-system1 1e-4` and `--chunk-size 16` after the
+    dataclass moved to ACT's values, so the config the source described was not the one
+    a bare invocation trained. Sourcing every default from `TrainConfig` makes the two
+    unable to disagree, and this asserts it.
+    """
+    from dataclasses import fields
+
+    from src.train import TrainConfig, parse_args
+
+    cli, defaults = parse_args([]), TrainConfig()
+    diverged = {f.name: (getattr(defaults, f.name), getattr(cli, f.name))
+                for f in fields(defaults)
+                if hasattr(cli, f.name) and getattr(defaults, f.name) != getattr(cli, f.name)}
+    assert diverged == {}
+
+
+def test_chunk_size_follows_the_selected_architecture():
+    """The two System 1s were designed around different chunk lengths."""
+    from src.train import DEFAULT_CHUNK_SIZE, TrainConfig, parse_args
+
+    assert DEFAULT_CHUNK_SIZE["act"] == 100
+    assert DEFAULT_CHUNK_SIZE["scratch"] == 16
+    assert TrainConfig(system1_arch="act").chunk_size == 100
+    assert TrainConfig(system1_arch="scratch").chunk_size == 16
+    assert parse_args(["--system1-arch", "scratch"]).chunk_size == 16
+    # An explicit value wins over the architecture's default.
+    assert parse_args(["--system1-arch", "scratch", "--chunk-size", "40"]).chunk_size == 40

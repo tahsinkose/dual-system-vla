@@ -31,6 +31,7 @@ import torch
 from torch import nn
 
 from src.models.system1 import System1, System1Config
+from src.models.system1_scratch import ScratchSystem1, ScratchSystem1Config
 from src.models.system2 import System2, System2Config
 
 
@@ -58,10 +59,17 @@ class Conditioning(str, Enum):
 PLACEHOLDER_PIXEL = 0.5
 
 
+# Which System 1 implementation to build. Both satisfy one contract, so nothing
+# downstream branches on the choice; see src/models/system1_scratch.py for how they
+# differ. Recorded in the checkpoint, so evaluation rebuilds what training used.
+SYSTEM1_ARCHS = ("act", "scratch")
+
+
 @dataclass
 class DualSystemConfig:
     system2: System2Config = field(default_factory=System2Config)
-    system1: System1Config = field(default_factory=System1Config)
+    system1: System1Config | ScratchSystem1Config = field(default_factory=System1Config)
+    system1_arch: str = "act"
 
     conditioning: Conditioning = Conditioning.LIVE
     latent_update_period: int = 10   # K, in environment steps
@@ -70,6 +78,13 @@ class DualSystemConfig:
     def __post_init__(self) -> None:
         if isinstance(self.conditioning, str):
             self.conditioning = Conditioning(self.conditioning)
+        if self.system1_arch not in SYSTEM1_ARCHS:
+            raise ValueError(f"system1_arch must be one of {SYSTEM1_ARCHS}, "
+                             f"got {self.system1_arch!r}")
+        expected = System1Config if self.system1_arch == "act" else ScratchSystem1Config
+        if not isinstance(self.system1, expected):
+            raise TypeError(f"system1_arch={self.system1_arch!r} needs a "
+                            f"{expected.__name__}, got {type(self.system1).__name__}")
         if self.system1.latent_dim != self.system2.latent_dim:
             raise ValueError(
                 "latent_dim must agree across the two systems: "
@@ -82,14 +97,18 @@ class DualSystemConfig:
 
 
 def tiny_config(**overrides) -> DualSystemConfig:
-    """Small end-to-end configuration for tests."""
-    from src.models.system1 import tiny_config as s1_tiny
+    """Small end-to-end configuration for tests, for either System 1 architecture."""
+    from src.models.system1 import tiny_config as act_tiny
+    from src.models.system1_scratch import tiny_config as scratch_tiny
     from src.models.system2 import tiny_config as s2_tiny
 
     latent_dim = overrides.pop("latent_dim", 32)
+    arch = overrides.pop("system1_arch", "act")
+    s1_tiny = act_tiny if arch == "act" else scratch_tiny
     return DualSystemConfig(
         system2=s2_tiny(latent_dim=latent_dim),
         system1=s1_tiny(latent_dim=latent_dim),
+        system1_arch=arch,
         **overrides,
     )
 
@@ -104,7 +123,8 @@ class DualSystem(nn.Module):
         self.system2 = System2(self.config.system2)
         # Statistics are needed only when building a model to train: they are persistent
         # buffers, so restoring a checkpoint carries whatever the run was trained with.
-        self.system1 = System1(self.config.system1, system1_stats)
+        system1_cls = System1 if self.config.system1_arch == "act" else ScratchSystem1
+        self.system1 = system1_cls(self.config.system1, system1_stats)
 
         # Rollout state, reset per episode. Kept off the module's parameters so it
         # never leaks into checkpoints.

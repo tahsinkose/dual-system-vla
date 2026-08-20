@@ -108,7 +108,14 @@ def classify(trace: dict, window: int, reference_distance: float | None = None) 
     proximity verdicts are skipped, since there is nothing to be short of.
     """
     done = trace["subtask_done"]
-    if done.size and bool(done[-1].all()):
+    # Success is the task's goal predicate: every *goal condition* true at once. Grasp
+    # subtasks are excluded because they are transient by construction — the gripper
+    # opens to place the object — so requiring them would report a solved episode as a
+    # failure, and requiring the final step alone would miss a goal that is met and then
+    # disturbed.
+    goals = [i for i, name in enumerate(trace["subtask_ids"])
+             if not name.startswith("grasp:")]
+    if done.size and goals and bool(done[:, goals].all(axis=1).any()):
         return "solved", {}
 
     grasp = grasp_step(trace)
@@ -174,35 +181,61 @@ def demo_reference(paths: list[Path]) -> dict | None:
     }
 
 
+def task_of(path: Path) -> str:
+    """The `taskNN` prefix a trace filename carries, or `""` if it has none.
+
+    Rollouts and demonstrations are matched on it because the target distance a
+    demonstration leaves an object at is task-specific: judging a basket task against a
+    caddy task's reference would classify correct behaviour as short-of-target.
+    """
+    stem = path.stem
+    return stem[:6] if stem.startswith("task") and stem[4:6].isdigit() else ""
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     rollouts = trace_paths(args.traces)
     if not rollouts:
         raise SystemExit(f"no traces found at {args.traces}")
 
-    reference = demo_reference(trace_paths(args.demo)) if args.demo else None
-    if reference:
-        print(f"demonstration reference ({reference['n']} episodes): "
-              f"grasp at step {reference['grasp_step']:.0f}, "
-              f"{reference['length']:.0f} steps, "
-              f"final goal distance {reference['final_distance_m']:.3f} m\n")
+    demos: dict[str, list[Path]] = {}
+    for path in (trace_paths(args.demo) if args.demo else []):
+        demos.setdefault(task_of(path), []).append(path)
+    references = {task: demo_reference(paths) for task, paths in demos.items()}
+    missing = sorted({task_of(p) for p in rollouts} - references.keys())
+    if missing:
+        print(f"no demonstration reference for {', '.join(missing) or 'untagged traces'}"
+              " — proximity verdicts skipped there\n", file=sys.stderr)
 
     verdicts: dict[str, int] = {}
+    per_task: dict[str, dict[str, int]] = {}
     for path in rollouts:
+        task = task_of(path)
+        reference = references.get(task)
         verdict, evidence = classify(load_trace(path), args.window,
                                      reference["final_distance_m"] if reference else None)
         verdicts[verdict] = verdicts.get(verdict, 0) + 1
+        per_task.setdefault(task, {})
+        per_task[task][verdict] = per_task[task].get(verdict, 0) + 1
         detail = "  ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}"
                            for k, v in evidence.items())
-        print(f"{path.stem:<24} {verdict:<16} {detail}")
+        print(f"{path.stem:<24} {verdict:<20} {detail}")
 
     print("\nverdicts:")
     for verdict, count in sorted(verdicts.items(), key=lambda kv: -kv[1]):
-        print(f"  {verdict:<18} {count:>3d}/{len(rollouts)}")
-    if reference and reference["final_distance_m"] == reference["final_distance_m"]:
-        print(f"\nreference final goal distance: {reference['final_distance_m']:.3f} m — a "
-              "rollout whose best distance never approaches this never got the object "
-              "to the target at all")
+        print(f"  {verdict:<20} {count:>3d}/{len(rollouts)}")
+
+    if len(per_task) > 1:
+        print("\nper task:")
+        for task in sorted(per_task):
+            counts = per_task[task]
+            total = sum(counts.values())
+            summary = "  ".join(f"{v}:{c}" for v, c in
+                                sorted(counts.items(), key=lambda kv: -kv[1]))
+            reference = references.get(task)
+            anchor = (f"  [demo ends at {reference['final_distance_m']:.3f} m]"
+                      if reference else "  [no reference]")
+            print(f"  {task or '(untagged)':<10} n={total:<4} {summary}{anchor}")
     return 0
 
 

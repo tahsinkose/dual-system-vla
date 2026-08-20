@@ -195,13 +195,12 @@ memory scales with batch size far more steeply than the 71.7M System 1 alone sug
 
 
 ```bash
-# headline number: CKPT-DUAL as trained, all ten tasks
-python -m eval.run_eval --checkpoint outputs/train/live/best.pt \
-  --log-path outputs/eval/dual-live.jsonl
+python -m eval.run_eval --checkpoint outputs/train/live/best.pt 
+  --conditioning live --init-source benchmark --output-dir outputs/eval/live
 
-# same checkpoint, different modality
-python -m eval.run_eval --checkpoint outputs/train/live/best.pt --conditioning zero \
-  --log-path outputs/eval/dual-zero.jsonl
+# same checkpoint, zero conditioning
+python -m eval.run_eval --checkpoint outputs/train/live/best.pt 
+  --conditioning zero --init-source benchmark --output-dir outputs/eval/ablation/zero
 ```
 
 Defaults follow LIBERO's published protocol: 10 trials per task from the benchmark's

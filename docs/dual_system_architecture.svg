@@ -30,20 +30,20 @@
 
   <!-- ===================== SYSTEM 2 ===================== -->
   <rect x="250" y="175" width="1360" height="345" rx="16" fill="#fdf6ec" stroke="#c98a2b" stroke-width="2"/>
-  <text x="270" y="205" font-size="17" font-weight="700" fill="#1a1a1a">SYSTEM 2 — Qwen2.5-VL-3B backbone</text>
+  <text x="270" y="205" font-size="17" font-weight="700" fill="#1a1a1a">SYSTEM 2 — Qwen2.5-VL-3B backbone · 3.76B params, 8.43M trainable</text>
   <text x="270" y="225" font-size="13" fill="#7a5b1e">every K env steps · ~1–2 Hz</text>
 
   <rect x="290" y="250" width="220" height="100" rx="10" fill="#eef0f3" stroke="#8a94a3" stroke-width="1.5"/>
   <text x="400" y="295" text-anchor="middle" font-size="13" font-weight="700" fill="#1a1a1a">Vision Encoder</text>
-  <text x="400" y="313" text-anchor="middle" font-size="11" fill="#4a5568">frozen — untouched</text>
+  <text x="400" y="313" text-anchor="middle" font-size="11" fill="#4a5568">668.7M · frozen, untouched</text>
 
   <rect x="560" y="245" width="480" height="230" rx="10" fill="#eef0f3" stroke="#8a94a3" stroke-width="1.5"/>
   <text x="800" y="280" text-anchor="middle" font-size="14" font-weight="700" fill="#1a1a1a">Qwen2.5 LM Decoder</text>
-  <text x="800" y="298" text-anchor="middle" font-size="11" fill="#4a5568">frozen backbone · ×N layers</text>
+  <text x="800" y="298" text-anchor="middle" font-size="11" fill="#4a5568">3.09B · frozen</text>
 
   <rect x="580" y="400" width="440" height="60" rx="8" fill="#ffe6bf" stroke="#c9781a" stroke-width="1.5"/>
   <text x="800" y="425" text-anchor="middle" font-size="12" font-weight="700" fill="#1a1a1a">attention q/k/v/o proj — LoRA r=16</text>
-  <text x="800" y="443" text-anchor="middle" font-size="10" fill="#7a4a12">only trainable part of the backbone</text>
+  <text x="800" y="443" text-anchor="middle" font-size="10" fill="#7a4a12">7.37M trainable — the only trainable part of the backbone</text>
 
   <rect x="1080" y="290" width="100" height="50" rx="8" fill="#eef0f3" stroke="#8a94a3" stroke-width="1.5"/>
   <text x="1130" y="311" text-anchor="middle" font-size="12" font-weight="700" fill="#1a1a1a">pool</text>
@@ -52,7 +52,7 @@
   <rect x="1230" y="270" width="180" height="90" rx="10" fill="#ffe6bf" stroke="#c9781a" stroke-width="2"/>
   <text x="1320" y="303" text-anchor="middle" font-size="13" font-weight="700" fill="#1a1a1a">latent head</text>
   <text x="1320" y="321" text-anchor="middle" font-size="11" fill="#7a4a12">trainable · fp32</text>
-  <text x="1320" y="337" text-anchor="middle" font-size="10" fill="#7a4a12">LayerNorm → Linear</text>
+  <text x="1320" y="337" text-anchor="middle" font-size="10" fill="#7a4a12">LayerNorm → Linear · 1.05M trainable</text>
 
   <!-- System 2 internal arrows -->
   <path d="M210,130 L535,130 L535,340 L560,340" fill="none" stroke="#1a1a1a" stroke-width="1.5" marker-end="url(#arrowBlack)"/>
@@ -82,7 +82,7 @@
 
   <!-- ===================== SYSTEM 1 ===================== -->
   <rect x="250" y="650" width="1360" height="320" rx="16" fill="#fff6e9" stroke="#c9781a" stroke-width="2"/>
-  <text x="270" y="680" font-size="17" font-weight="700" fill="#1a1a1a">SYSTEM 1 — cross-attention encoder–decoder</text>
+  <text x="270" y="680" font-size="17" font-weight="700" fill="#1a1a1a">SYSTEM 1 — encoder–decoder · 71.74M params, all trainable</text>
   <text x="270" y="700" font-size="13" fill="#7a4a12">every env step · ~20 Hz · trained from scratch</text>
 
   <rect x="290" y="720" width="220" height="90" rx="10" fill="#ffffff" stroke="#c9781a" stroke-width="1.5"/>
@@ -97,12 +97,12 @@
   <rect x="870" y="720" width="340" height="150" rx="10" fill="#ffffff" stroke="#c9781a" stroke-width="2"/>
   <text x="1040" y="760" text-anchor="middle" font-size="14" font-weight="700" fill="#1a1a1a">cross-attention</text>
   <text x="1040" y="780" text-anchor="middle" font-size="14" font-weight="700" fill="#1a1a1a">encoder–decoder</text>
-  <text x="1040" y="802" text-anchor="middle" font-size="11" fill="#4a5568">~80M params, conv-init</text>
+  <text x="1040" y="802" text-anchor="middle" font-size="11" fill="#4a5568">8 enc + 8 dec · d=512 · 8 heads · ff 2048</text>
   <text x="1040" y="822" text-anchor="middle" font-size="11" font-weight="700" fill="#8a3a00">no language input</text>
 
   <rect x="1260" y="755" width="200" height="80" rx="10" fill="#ffe6bf" stroke="#c9781a" stroke-width="2"/>
   <text x="1360" y="785" text-anchor="middle" font-size="13" font-weight="700" fill="#1a1a1a">action chunk</text>
-  <text x="1360" y="803" text-anchor="middle" font-size="11" fill="#7a4a12">N × Box(-1,1)⁷</text>
+  <text x="1360" y="803" text-anchor="middle" font-size="11" fill="#7a4a12">16 × 7 · unsquashed</text>
 
   <text x="1360" y="850" text-anchor="middle" font-size="11" fill="#7a4a12">loss ℒ(action)</text>
 

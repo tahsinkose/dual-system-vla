@@ -516,15 +516,58 @@ def test_resume_accepts_a_run_directory(tmp_path):
 def test_resume_restores_step_and_optimizer_state(tmp_path):
     import torch
 
-    from src.train import TrainConfig, build_model, build_optimizer, restore
+    from src.train import build_model, build_optimizer, restore
 
     cfg, checkpoint, _run = _seed_run(tmp_path)
     model = build_model(cfg)
     optimizer = build_optimizer(model, cfg)
-    step, path = restore(model, optimizer, checkpoint, torch.device("cpu"))
+    resumed = restore(model, optimizer, checkpoint, torch.device("cpu"))
 
-    assert step == 4200
-    assert path == checkpoint
+    assert resumed.step == 4200
+    assert resumed.path == checkpoint
+
+
+def test_resume_carries_the_score_best_pt_was_written_at(tmp_path):
+    """Otherwise the first scoring pass after a resume overwrites `best.pt` however
+    badly it went, discarding a bar the earlier run had already cleared."""
+    import torch
+
+    from src.train import (
+        TrainConfig,
+        build_model,
+        build_optimizer,
+        restore,
+        save_checkpoint,
+    )
+
+    cfg, _checkpoint, run_dir = _seed_run(tmp_path)
+    model = build_model(cfg)
+    best = save_checkpoint(model, cfg, 4200, run_dir, filename="best.pt",
+                           val_loss=0.041, success_rate=0.27,
+                           optimizer=build_optimizer(model, cfg))
+
+    resumed = restore(model, build_optimizer(model, cfg), best, torch.device("cpu"))
+    assert resumed.success_rate == pytest.approx(0.27)
+    assert resumed.val_loss == pytest.approx(0.041)
+
+    # The inherited bar is what a later pass has to beat.
+    inherited = (resumed.success_rate, -resumed.val_loss)
+    assert (0.20, -0.001) < inherited      # a worse rate does not replace it
+    assert (0.30, -0.09) > inherited       # a better rate does, despite a worse loss
+
+
+def test_resume_without_a_recorded_score_starts_from_the_sentinel(tmp_path):
+    """A checkpoint predating score recording must still resume, just without a bar."""
+    import torch
+
+    from src.train import build_model, build_optimizer, restore
+
+    cfg, checkpoint, _run = _seed_run(tmp_path)
+    model = build_model(cfg)
+    resumed = restore(model, build_optimizer(model, cfg), checkpoint,
+                      torch.device("cpu"))
+    assert resumed.success_rate is None
+    assert resumed.val_loss is None
 
 
 def test_resume_without_optimizer_state_still_loads(tmp_path, capsys):
@@ -539,9 +582,9 @@ def test_resume_without_optimizer_state_still_loads(tmp_path, capsys):
     torch.save(payload, checkpoint)
 
     model = build_model(cfg)
-    step, _path = restore(model, build_optimizer(model, cfg), checkpoint,
-                          torch.device("cpu"))
-    assert step == 4200
+    resumed = restore(model, build_optimizer(model, cfg), checkpoint,
+                      torch.device("cpu"))
+    assert resumed.step == 4200
     assert "no optimiser state" in capsys.readouterr().out
 
 
@@ -552,3 +595,49 @@ def test_resume_needs_the_config_sidecar(tmp_path):
     (run_dir / "config.json").unlink()
     with pytest.raises(SystemExit, match="no config.json"):
         parse_args(["--resume", str(checkpoint)])
+
+
+# --------------------------------------------------------------------- rollout gate
+
+
+def test_gate_tasks_are_fixed():
+    """`best.pt` is only comparable across runs if every run scored on the same set."""
+    from src.train import GATE_TASK_INDICES
+
+    assert GATE_TASK_INDICES == (5, 6, 9)
+
+
+def test_gate_defaults_to_thirty_rollouts():
+    from src.train import GATE_TASK_INDICES, TrainConfig
+
+    cfg = TrainConfig()
+    assert cfg.gate_rollouts is True
+    assert cfg.gate_trials_per_task * len(GATE_TASK_INDICES) == 30
+
+
+def test_success_rate_decides_and_loss_only_breaks_ties():
+    """The ordering `best.pt` is chosen by.
+
+    Success rate dominates: a checkpoint that solves more tasks wins even with a worse
+    loss, which is the point of scoring rollouts at all — configurations have scored
+    competitively on loss here and failed in simulation. Loss separates equal rates.
+    """
+    def key(rate, val_loss):
+        return (rate, -val_loss)
+
+    # Higher success wins despite a worse (higher) loss.
+    assert key(0.30, 0.09) > key(0.20, 0.04)
+    # Equal success: the lower loss wins.
+    assert key(0.30, 0.04) > key(0.30, 0.09)
+    # Anything beats the initial sentinel.
+    assert key(0.0, 1.0) > (-1.0, float("-inf"))
+
+
+def test_gate_is_skipped_when_it_cannot_mean_anything():
+    """`--tiny` builds random weights, and val_every=0 disables the scoring pass."""
+    from src.train import TrainConfig
+
+    for cfg in (TrainConfig(tiny=True), TrainConfig(val_every=0),
+                TrainConfig(gate_rollouts=False)):
+        enabled = cfg.gate_rollouts and cfg.val_every > 0 and not cfg.tiny
+        assert enabled is False

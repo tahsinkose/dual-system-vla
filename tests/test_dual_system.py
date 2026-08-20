@@ -21,7 +21,8 @@ from src.models.dual_system import (  # noqa: E402
     DualSystemConfig,
     tiny_config,
 )
-from src.models.system1 import tiny_config as s1_tiny  # noqa: E402
+from src.models.system1 import tiny_config as act_tiny  # noqa: E402
+from src.models.system1_scratch import tiny_config as s1_tiny  # noqa: E402
 from src.models.system2 import tiny_config as s2_tiny  # noqa: E402
 
 INSTRUCTION = "put both the alphabet soup and the tomato sauce in the basket"
@@ -29,9 +30,12 @@ INSTRUCTION = "put both the alphabet soup and the tomato sauce in the basket"
 
 @pytest.fixture(scope="module")
 def model() -> DualSystem:
-    """Inference mode: System 1's CVAE encoder runs only in training mode, and demands
-    the ground-truth action chunk when it does. Tests that need it opt in via
-    `supervision()`."""
+    """The default System 1, in inference mode.
+
+    Mode matters for the ACT architecture, whose CVAE encoder runs only while training
+    and demands the ground-truth chunk when it does; tests needing it opt in via
+    `supervision()`.
+    """
     return DualSystem(tiny_config()).eval()
 
 
@@ -64,12 +68,14 @@ def test_forward_returns_actions_latent_and_style_latent(model):
     assert style_latent == (None, None)
 
 
-def test_forward_infers_the_style_latent_when_training(model):
+def test_forward_infers_the_style_latent_when_training():
     """The CVAE parameters come back so the training loop can add the KLD term.
 
     The loss lives outside the model — that is what keeps one forward serving both
-    training and rollout — so the term's operands have to cross the boundary.
+    training and rollout — so the term's operands have to cross the boundary. Specific
+    to the ACT architecture, which is the only one with a CVAE.
     """
+    model = DualSystem(tiny_config(system1_arch="act")).eval()
     images, state, s2_images, instructions = observation(model)
     actions, is_pad = supervision(model)
     model.train()

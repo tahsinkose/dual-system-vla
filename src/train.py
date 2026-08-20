@@ -43,6 +43,8 @@ from src.models.system1_scratch import ScratchSystem1Config  # noqa: E402
 from src.models.system2 import System2Config  # noqa: E402
 from src.observations import ModelObservation  # noqa: E402
 
+from eval.trials import DEFAULT_TRIALS_PER_TASK  # noqa: E402
+
 REPO_ID = "lerobot/libero_10"
 
 # Each System 1 carries its own action-chunk length, and they differ: ACT predicts 100
@@ -57,6 +59,11 @@ DEFAULT_CHUNK_SIZE = {"act": System1Config.chunk_size,
 # model being trained under a contract its weights were not learned under.
 ARCHITECTURE_FIELDS = ("system1_arch", "chunk_size", "latent_dim", "temporal_offset",
                        "conditioning", "tiny")
+
+# Tasks the in-training rollout gate scores on. Fixed rather than configurable: `best.pt`
+# is only comparable across runs if every run was scored on the same set, and these three
+# are the ones whose subtask breakdowns separate architectures rather than bottoming out.
+GATE_TASK_INDICES = (5, 6, 9)
 
 # The dataset stores System 1's cameras under these names; the wrist camera is renamed
 # to the canonical key by the observation adapter.
@@ -74,9 +81,8 @@ class TrainConfig:
     num_workers: int = 8
     seed: int = 0
 
-    # System 1 trains from scratch and wants a higher rate than the LoRA adapters
-    # sitting on top of an already-good pretrained encoder.
-    lr_system1: float = 1e-5   # ACT's own rate for both its transformer and backbone
+    # Both at 1e-5 — ACT's own rate, for its transformer and backbone alike.
+    lr_system1: float = 1e-5
     lr_system2: float = 1e-5
     weight_decay: float = 1e-4
     kl_weight: float = 10.0     # weight on the CVAE style latent's KLD term
@@ -94,11 +100,23 @@ class TrainConfig:
 
     log_every: int = 100
     checkpoint_every: int = 5_000
-    # Episodes withheld from training, per task, to score on. At 0 nothing is withheld
-    # and the scoring pass runs over training episodes instead — see `build_datasets`.
-    val_fraction: float = 0.1
-    val_every: int = 1_000        # steps between scoring passes; 0 disables them
+    # Episodes withheld from training, per task, to score on. At the default 0 nothing
+    # is withheld and the scoring pass runs in-sample — see `build_datasets`.
+    val_fraction: float = 0.0
+    val_every: int = 2_000        # steps between scoring passes; 0 disables them
     val_samples: int = 512        # bounds cost; spread across every task
+
+    # In-simulator rollouts on GATE_TASK_INDICES, scored at the same cadence, selecting
+    # `best.pt` by success rate. This is expensive — trials_per_task x 3 tasks episodes
+    # of up to `gate_horizon` steps each, with a fresh LIBERO env per episode — and it
+    # is what makes `best.pt` mean "solved the most tasks" rather than "fit the
+    # demonstrations best", which loss alone has repeatedly failed to predict.
+    gate_rollouts: bool = True
+    gate_trials_per_task: int = DEFAULT_TRIALS_PER_TASK
+    # A trained policy runs slower than the demonstrator it imitates, and task 6's
+    # demonstrations already average 407 steps; too tight a horizon scores solved
+    # episodes as failures.
+    gate_horizon: int = 800
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Restrict to these dataset task indices; None means all ten.
@@ -213,12 +231,13 @@ def build_datasets(cfg: TrainConfig):
 
     Which episodes are *trained on* and which are *scored* are separate choices.
 
-    At ``val_fraction > 0`` a stride of each task's episodes is withheld from training
-    and scored, giving a held-out loss that reveals overfitting. At ``val_fraction ==
-    0`` every episode trains, and the scoring pass runs over training episodes instead
-    — the loss it reports is in-sample, tracks the training loss, and says nothing
-    about generalisation. It still yields a smooth, fixed-sample series to select a
-    checkpoint from, which a per-step training loss over shuffled batches does not.
+    At the default ``val_fraction == 0`` every episode trains and the scoring pass runs
+    over training episodes: the loss it reports is in-sample, tracks the training loss,
+    and says nothing about generalisation. It still yields a smooth, fixed-sample series
+    to select a checkpoint from, which a per-step training loss over shuffled batches
+    does not. Above 0, a stride of each task's episodes is withheld and scored instead,
+    giving a held-out loss that reveals overfitting — paid for with that fraction of the
+    training data.
 
     Neither number is the success metric. That is measured by rolling out in the
     simulator from LIBERO's own initial states (see eval/trials.py), which no
@@ -452,7 +471,8 @@ class MetricsLog:
             }) + "\n")
 
     def log_validation(self, step: int, val_loss: float, is_best: bool,
-                       held_out: bool = True) -> None:
+                       held_out: bool = True, success_rate: float | None = None,
+                       successes_per_task: dict[int, int] | None = None) -> None:
         with self.path.open("a") as handle:
             handle.write(json.dumps({
                 "type": "validation",
@@ -460,6 +480,10 @@ class MetricsLog:
                 # False when nothing was withheld from training: the loss is in-sample,
                 # and a plot that treats it as a generalisation curve would mislead.
                 "held_out": held_out,
+                # Present once the rollout gate is running; it, not the loss, is what
+                # `is_best` reflects.
+                "success_rate": success_rate,
+                "successes_per_task": successes_per_task,
                 "val_loss": round(val_loss, 6),
                 "is_best": is_best,
             }) + "\n")
@@ -480,7 +504,10 @@ class MetricsLog:
 
 
 def validation_subset(dataset, max_samples: int):
-    """A fixed subset that spans every task,.
+    """A fixed, task-spanning subset.
+
+    Fixed, so successive scoring passes move with the model rather than the sample.
+    Samples are ordered by episode, so the stride is what spreads them across tasks.
     """
     from torch.utils.data import Subset
 
@@ -520,9 +547,23 @@ def validate(model: DualSystem, loader, device: torch.device) -> float:
     return total / max(batches, 1)
 
 
+@dataclass
+class Restored:
+    """What a resumed run inherits from the checkpoint it continues."""
+
+    step: int
+    path: Path
+    # The score `best.pt` was last written at, when the checkpoint records one. Without
+    # it a resumed run starts from the sentinel and overwrites `best.pt` on its first
+    # scoring pass, however badly that pass went — discarding the bar the earlier run
+    # had already cleared.
+    success_rate: float | None = None
+    val_loss: float | None = None
+
+
 def restore(model: DualSystem, optimizer: torch.optim.Optimizer, path: Path,
-            device: torch.device) -> tuple[int, Path]:
-    """Load weights and optimiser state from `path`. Returns ``(next_step, path)``.
+            device: torch.device) -> Restored:
+    """Load weights and optimiser state from `path`.
 
     `strict=True`: a key or shape mismatch means the architecture does not match the one
     that produced these weights, and continuing from a partially-loaded model would
@@ -540,7 +581,83 @@ def restore(model: DualSystem, optimizer: torch.optim.Optimizer, path: Path,
     else:
         print(f"NOTE: {checkpoint_path.name} carries no optimiser state; Adam's moment "
               "estimates restart from zero.")
-    return int(payload["step"]), checkpoint_path
+    return Restored(step=int(payload["step"]), path=checkpoint_path,
+                    success_rate=payload.get("success_rate"),
+                    val_loss=payload.get("val_loss"))
+
+
+class RolloutGate:
+    """Scores a checkpoint by success rate in the simulator, on a fixed task set.
+
+    Runs the *same* rollout as `eval/run_eval.py` — the harness's `run_episode`, its
+    trial construction, LIBERO's own initial states — so a number reported here means
+    what the same number means at evaluation time. Anything reimplemented would be free
+    to drift from it.
+
+    Trials are enumerated once and reused, so every scoring pass faces an identical set
+    and successive rates differ because the policy changed. Environments are built per
+    episode rather than cached: LIBERO carries mutable simulator state, and a reused env
+    would let one episode's outcome bias the next.
+    """
+
+    def __init__(self, dataset, cfg: TrainConfig, device: torch.device) -> None:
+        from eval.run_eval import EvalConfig
+        from eval.trials import InitSource, build_trials
+        from src.utils import TaskMapping
+
+        self._device = device
+        self._mapping = TaskMapping.from_dataset(dataset)
+        self._trials = build_trials(self._mapping, dataset, InitSource.BENCHMARK,
+                                    task_indices=list(GATE_TASK_INDICES),
+                                    trials_per_task=cfg.gate_trials_per_task)
+        self._conditioning = Conditioning(cfg.conditioning)
+        self._eval_cfg = EvalConfig(checkpoint=Path("in-training"),
+                                    horizon=cfg.gate_horizon,
+                                    log_path=Path(cfg.output_dir) / "gate.jsonl")
+
+    def __len__(self) -> int:
+        return len(self._trials)
+
+    @property
+    def task_indices(self) -> tuple[int, ...]:
+        return GATE_TASK_INDICES
+
+    def score(self, model: DualSystem) -> tuple[float, dict[int, int]]:
+        """Returns ``(success_rate, successes_per_task)``.
+
+        Restores training mode afterwards; leaving the model in eval mode would disable
+        dropout for the remainder of the run and make the loss curve look better rather
+        than worse.
+        """
+        from eval.perturbations import PerturbationKind, PerturbationSpec
+        from eval.run_eval import build_env, run_episode
+
+        was_training = model.training
+        model.eval()
+        per_task = {index: 0 for index in GATE_TASK_INDICES}
+        successes = 0
+        try:
+            for trial in self._trials:
+                task = self._mapping.by_dataset_index(trial.task_dataset_index)
+                env = build_env(task, self._eval_cfg.camera_size, self._eval_cfg.horizon)
+                try:
+                    env.seed(0)   # determinism comes from the forced initial state
+                    result = run_episode(
+                        model, env, trial,
+                        eval_conditioning=self._conditioning,
+                        trained_conditioning=self._conditioning,
+                        perturbation=PerturbationSpec(kind=PerturbationKind.NONE,
+                                                      trigger=None,
+                                                      episode_seed=(0, trial.index)),
+                        cfg=self._eval_cfg, checkpoint_path="in-training",
+                        device=self._device)
+                finally:
+                    env.close()
+                successes += result.success
+                per_task[trial.task_dataset_index] += result.success
+        finally:
+            model.train(was_training)
+        return successes / max(len(self._trials), 1), per_task
 
 
 # ------------------------------------------------------------------------- loop
@@ -570,9 +687,14 @@ def train(cfg: TrainConfig) -> Path:
     optimizer = build_optimizer(model, cfg)
     counts = model.parameter_counts()
 
-    start_step, resumed_from = 0, None
+    start_step, resumed = 0, None
     if cfg.resume is not None:
-        start_step, resumed_from = restore(model, optimizer, cfg.resume, device)
+        resumed = restore(model, optimizer, cfg.resume, device)
+        start_step = resumed.step
+
+    gate = None
+    if cfg.gate_rollouts and cfg.val_every > 0 and not cfg.tiny:
+        gate = RolloutGate(dataset, cfg, device)
 
     output_dir = Path(cfg.output_dir) / cfg.conditioning
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -589,10 +711,21 @@ def train(cfg: TrainConfig) -> Path:
         scoring = "in-sample/nothing with-held"
     print(f"episodes     : {dataset.num_episodes} train")
     print(f"scored on    : {scoring}")
+    if gate is not None:
+        print(f"best.pt by   : success rate over {len(gate)} rollouts "
+              f"(tasks {', '.join(str(i) for i in gate.task_indices)}), every "
+              f"{cfg.val_every} steps")
+    else:
+        print("best.pt by   : loss" if cfg.val_every > 0 else "best.pt by   : not selected")
     print(f"trainable    : {counts['trainable'] / 1e6:.2f}M of {counts['total'] / 1e6:.2f}M")
     print(f"device       : {device}")
-    if resumed_from is not None:
-        print(f"resumed      : {resumed_from} at step {start_step}")
+    if resumed is not None:
+        inherited = ""
+        if resumed.success_rate is not None:
+            inherited = f", carrying best {resumed.success_rate:.1%}"
+        elif resumed.val_loss is not None:
+            inherited = f", carrying best loss {resumed.val_loss:.4f}"
+        print(f"resumed      : {resumed.path} at step {start_step}{inherited}")
     print(f"metrics      : {output_dir / 'metrics.jsonl'}\n")
 
     metrics = MetricsLog(output_dir / "metrics.jsonl", cfg, counts,
@@ -605,7 +738,16 @@ def train(cfg: TrainConfig) -> Path:
     running = 0.0
     running_kld = 0.0
     last_log_at = started
+    # A resumed run inherits the bar its checkpoint was written at, so `best.pt` is only
+    # replaced by something that actually beats it. A checkpoint that records neither
+    # score leaves the sentinel, and the first scoring pass sets the bar.
     best_val = float("inf")
+    best_gate = (-1.0, float("-inf"))
+    if resumed is not None:
+        if resumed.val_loss is not None:
+            best_val = resumed.val_loss
+        if resumed.success_rate is not None:
+            best_gate = (resumed.success_rate, -(resumed.val_loss or 0.0))
     while step < cfg.steps:
         for batch in loader:
             if step >= cfg.steps:
@@ -645,21 +787,42 @@ def train(cfg: TrainConfig) -> Path:
                 running = 0.0
                 running_kld = 0.0
                 last_log_at = now
-            if val_loader is not None and step % cfg.val_every == 0:
-                val_loss = validate(model, val_loader, device)
-                improved = val_loss < best_val
-                marker = "  <- best" if improved else f"  (best {best_val:.4f})"
-                label = "val" if score_is_held_out else "in-sample"
-                print(f"step {step:>7d} | {label:>9s} {val_loss:.4f}{marker}")
-                metrics.log_validation(step, val_loss, is_best=improved,
-                                       held_out=score_is_held_out)
+            if cfg.val_every > 0 and step % cfg.val_every == 0:
+                val_loss = None
+                if val_loader is not None:
+                    val_loss = validate(model, val_loader, device)
+                    label = "val" if score_is_held_out else "in-sample"
+                    print(f"step {step:>7d} | {label:>9s} {val_loss:.4f}")
+
+                if gate is not None:
+                    rate, per_task = gate.score(model)
+                    # Success rate decides, loss only breaks ties: rollouts are the
+                    # quantity the study reports, and configurations have scored
+                    # competitively on loss here while failing in simulation.
+                    improved = (rate, -(val_loss if val_loss is not None else 0.0)) > best_gate
+                    marker = "  <- best" if improved else f"  (best {best_gate[0]:.1%})"
+                    breakdown = "  ".join(f"t{index}:{count}/{cfg.gate_trials_per_task}"
+                                          for index, count in sorted(per_task.items()))
+                    print(f"step {step:>7d} |   gate {rate:.1%} of {len(gate)}"
+                          f"  [{breakdown}]{marker}")
+                    if improved:
+                        best_gate = (rate, -(val_loss if val_loss is not None else 0.0))
+                else:
+                    improved = val_loss is not None and val_loss < best_val
+                    if improved:
+                        best_val = val_loss
+                    rate, per_task = None, None
+
+                if val_loss is not None:
+                    metrics.log_validation(step, val_loss, is_best=improved,
+                                           held_out=score_is_held_out,
+                                           success_rate=rate, successes_per_task=per_task)
                 if improved:
-                    best_val = val_loss
                     # A stable filename so evaluation never has to guess which step to
                     # take from a directory of checkpoints.
                     save_checkpoint(model, cfg, step, output_dir,
                                     filename="best.pt", val_loss=val_loss,
-                                    optimizer=optimizer)
+                                    optimizer=optimizer, success_rate=rate)
             if step % cfg.checkpoint_every == 0:
                 save_checkpoint(model, cfg, step, output_dir, optimizer=optimizer)
 
@@ -670,7 +833,8 @@ def train(cfg: TrainConfig) -> Path:
 
 def save_checkpoint(model: DualSystem, cfg: TrainConfig, step: int, output_dir: Path,
                     filename: str | None = None, val_loss: float | None = None,
-                    optimizer: torch.optim.Optimizer | None = None) -> Path:
+                    optimizer: torch.optim.Optimizer | None = None,
+                    success_rate: float | None = None) -> Path:
     path = output_dir / (filename or f"step_{step:07d}.pt")
     payload = {"step": step, "conditioning": cfg.conditioning,
                "state_dict": model.state_dict()}
@@ -680,6 +844,8 @@ def save_checkpoint(model: DualSystem, cfg: TrainConfig, step: int, output_dir: 
         payload["optimizer"] = optimizer.state_dict()
     if val_loss is not None:
         payload["val_loss"] = val_loss
+    if success_rate is not None:
+        payload["success_rate"] = success_rate
     torch.save(payload, path)
     return path
 
@@ -725,13 +891,25 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
                    help="small random models, for exercising the loop itself")
     p.add_argument("--val-fraction", type=float, default=TrainConfig.val_fraction,
                    help="fraction of each task's episodes held out from training and "
-                        "scored (default: 0.1). At 0 every episode trains and the "
-                        "scoring pass runs in-sample: best.pt is still written, but the "
-                        "loss says nothing about generalisation. Either way the success "
-                        "metric comes from simulator rollouts against LIBERO's own "
-                        "initial states")
+                        "scored (default: 0, nothing withheld). At 0 every episode "
+                        "trains and the scoring pass runs in-sample: best.pt is still "
+                        "written, but the loss says nothing about generalisation. Above "
+                        "0 the held-out loss reveals overfitting, at the cost of that "
+                        "fraction of the training data. Either way the success metric "
+                        "comes from simulator rollouts against LIBERO's own initial "
+                        "states")
     p.add_argument("--val-every", type=int, default=TrainConfig.val_every,
                    help="steps between scoring passes; 0 disables them and best.pt")
+    p.add_argument("--no-gate-rollouts", dest="gate_rollouts", action="store_false",
+                   default=TrainConfig.gate_rollouts,
+                   help="select best.pt by loss instead of by in-simulator success rate")
+    p.add_argument("--gate-trials-per-task", type=int,
+                   default=TrainConfig.gate_trials_per_task,
+                   help=f"rollouts per gate task (default: "
+                        f"{TrainConfig.gate_trials_per_task}, over tasks "
+                        + ", ".join(str(i) for i in GATE_TASK_INDICES) + ")")
+    p.add_argument("--gate-horizon", type=int, default=TrainConfig.gate_horizon,
+                   help="max env steps per gate rollout")
     p.add_argument("--val-samples", type=int, default=TrainConfig.val_samples,
                    help="validation samples per pass, strided across every task")
     p.add_argument("--log-every", type=int, default=TrainConfig.log_every)

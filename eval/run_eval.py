@@ -54,6 +54,7 @@ from eval.perturbations import (  # noqa: E402
     snapshot_target_object_pose,
 )
 from eval.subtasks import SubtaskTracker, subtasks_for  # noqa: E402
+from eval.trace import RolloutTracer  # noqa: E402
 from eval.trials import DEFAULT_TRIALS_PER_TASK, InitSource, Trial, build_trials  # noqa: E402
 from eval.video import RolloutVideoWriter  # noqa: E402
 
@@ -81,6 +82,7 @@ class EvalConfig:
     video_dir: Path | None = None
     log_path: Path = Path("outputs/eval/results.jsonl")
     latent_trace: bool = False
+    trace_dir: Path | None = None            # per-step .npz diagnostics per episode
     allow_unmatched_episodes: bool = False   # run episodes with no recovered init state
                                               # (object layout will not match the recording)
     device: str = DEFAULT_DEVICE
@@ -92,6 +94,8 @@ class EvalConfig:
         if self.video_dir is not None:
             self.video_dir = Path(self.video_dir)
         self.log_path = Path(self.log_path)
+        if self.trace_dir is not None:
+            self.trace_dir = Path(self.trace_dir)
 
         kind = PerturbationKind(self.perturb)
         trigger_fields = (self.perturb_at_step, self.perturb_after_success_steps)
@@ -205,7 +209,9 @@ def run_episode(
     obs = reset_episode(env, trial.init_state, cfg.settle_steps)
     # Built after settling, so `achieved_at_reset` describes the configuration the
     # policy actually starts from.
-    tracker = SubtaskTracker(subtasks_for(trial.bddl), env)
+    subtasks = subtasks_for(trial.bddl)
+    tracker = SubtaskTracker(subtasks, env)
+    tracer = RolloutTracer(env, subtasks) if cfg.trace_dir is not None else None
     snapshot = snapshot_target_object_pose(env)   # baseline for UNDO_PROGRESS
     scheduler = PerturbationScheduler(perturbation)
     rng = perturbation.make_rng()
@@ -242,10 +248,15 @@ def run_episode(
                 latents_trace.append(z[0].cpu().numpy())
                 steps_since_update_trace.append(model.steps_since_latent_update)
 
-            action = np.clip(actions[0, 0].cpu().numpy(), -1.0, 1.0)
+            action_raw = actions[0, 0].cpu().numpy()
+            action = np.clip(action_raw, -1.0, 1.0)
             obs, _reward, _done, _info = env.step(action)
 
             tracker.update(step_index)
+            if tracer is not None:
+                tracer.record(step_index, obs, action, action_raw=action_raw,
+                              latent=z[0].cpu().numpy(),
+                              steps_since_update=model.steps_since_latent_update)
             if env.check_success():
                 success = True
                 if (trigger_step is not None and step_index > trigger_step
@@ -286,6 +297,9 @@ def run_episode(
     finally:
         if video is not None:
             video.close()
+
+    if tracer is not None:
+        tracer.write(cfg.trace_dir / f"{trial.name}.npz")
 
     latent_trace_path = None
     if record_latents and latents_trace:
@@ -413,6 +427,11 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
     p.add_argument("--log-path", type=Path, default=Path("outputs/eval/results.jsonl"))
     p.add_argument("--latent-trace", action="store_true",
                    help="dump a full per-step latent trace per episode; opt-in, larger artifact")
+    p.add_argument("--trace-dir", type=Path, default=None,
+                   help="write a per-step diagnostic .npz per episode here (state, actions, "
+                        "subtask flags, object positions, object-to-goal distances). Pair with "
+                        "scripts/replay_episode.py --trace to get the demonstration reference, "
+                        "then classify with scripts/analyze_traces.py")
     p.add_argument("--allow-unmatched-episodes", action="store_true")
     p.add_argument("--device", default=DEFAULT_DEVICE)
     p.add_argument("--seed", type=int, default=0, help="seeds perturbation randomness per episode")

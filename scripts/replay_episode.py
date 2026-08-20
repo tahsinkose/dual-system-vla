@@ -51,6 +51,7 @@ from src.utils import (  # noqa: E402
 )
 
 from eval.subtasks import SubtaskTracker, subtasks_for  # noqa: E402
+from eval.trace import RolloutTracer  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +72,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--realtime", action="store_true", help="Throttle the viewer to wall-clock speed")
     p.add_argument("--subtasks", action="store_true",
                    help="Report the step at which each subtask of the task completes")
+    p.add_argument("--trace", type=Path, default=None,
+                   help="Write a per-step .npz in the same schema eval/run_eval.py's "
+                        "--trace-dir produces. A demonstration solves its task, so its "
+                        "trace is the reference scripts/analyze_traces.py judges "
+                        "rollouts against")
     return p.parse_args()
 
 
@@ -95,6 +101,7 @@ def replay(env, actions, init_state, recorded_state, args, subtasks=None):
     # Built after settling, so a condition reported as already satisfied really was
     # satisfied by the initial layout rather than by the objects still moving.
     tracker = SubtaskTracker(subtasks, env) if subtasks else None
+    tracer = RolloutTracer(env, subtasks) if (subtasks and args.trace) else None
 
     trace = []
     frames = []
@@ -115,6 +122,8 @@ def replay(env, actions, init_state, recorded_state, args, subtasks=None):
                 steps += 1
                 if tracker is not None:
                     tracker.update(steps - 1)
+                if tracer is not None:
+                    tracer.record(steps - 1, obs, np.asarray(action, dtype=np.float64))
                 trace.append(obs["robot0_eef_pos"].copy())
                 if args.video is not None:
                     frames.append(agentview_upright(obs["agentview_image"]))
@@ -132,6 +141,8 @@ def replay(env, actions, init_state, recorded_state, args, subtasks=None):
             if done or (viewer is not None and not viewer.is_running()):
                 break
 
+    if tracer is not None:
+        print(f"  wrote {tracer.write(args.trace)}")
     if frames:
         write_video(frames, args.video)
     trace = np.array(trace)

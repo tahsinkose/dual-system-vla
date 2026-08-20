@@ -51,6 +51,13 @@ REPO_ID = "lerobot/libero_10"
 DEFAULT_CHUNK_SIZE = {"act": System1Config.chunk_size,
                       "scratch": ScratchSystem1Config.chunk_size}
 
+# What a checkpoint's weights are shaped by. Continuing a run has to reuse these
+# exactly: a different value does not produce a differently-configured continuation, it
+# produces a `load_state_dict` failure or — worse, where shapes happen to agree — a
+# model being trained under a contract its weights were not learned under.
+ARCHITECTURE_FIELDS = ("system1_arch", "chunk_size", "latent_dim", "temporal_offset",
+                       "conditioning", "tiny")
+
 # The dataset stores System 1's cameras under these names; the wrist camera is renamed
 # to the canonical key by the observation adapter.
 DATASET_MAIN_CAMERA = "observation.images.image"
@@ -75,9 +82,9 @@ class TrainConfig:
     kl_weight: float = 10.0     # weight on the CVAE style latent's KLD term
     grad_clip: float = 1.0
 
-    # Which System 1 to build: "act" wraps LeRobot's ACT, "scratch" the from-scratch
-    # encoder-decoder in src/models/system1_scratch.py.
-    system1_arch: str = "act"
+    # Which System 1 to build: "scratch" the from-scratch encoder-decoder in
+    # src/models/system1_scratch.py, "act" wraps LeRobot's ACT.
+    system1_arch: str = "scratch"
 
     # None resolves to the selected architecture's default; see DEFAULT_CHUNK_SIZE.
     chunk_size: int | None = None
@@ -100,6 +107,9 @@ class TrainConfig:
     # §1 training gate — loss must fall, gradients must reach System 2.
     overfit_episodes: int | None = None
     tiny: bool = False   # small random models, for testing the loop itself
+    # Checkpoint to continue from. The fields in ARCHITECTURE_FIELDS are then taken
+    # from that run's config.json rather than from this one; see `resume_config`.
+    resume: Path | None = None
 
     def __post_init__(self) -> None:
         if self.system1_arch not in SYSTEM1_ARCHS:
@@ -142,6 +152,60 @@ def split_episodes(episodes: list[int], val_fraction: float) -> tuple[list[int],
         val = val[:1]
     train = [e for e in episodes if e not in set(val)]
     return train, val
+
+
+def resume_config(cfg: TrainConfig, explicit: set[str]) -> TrainConfig:
+    """Fold a checkpoint's own configuration into `cfg`, for continuing that run.
+
+    The checkpoint's `config.json` — the same sidecar `eval/checkpoints.py` reads — wins
+    for everything in ARCHITECTURE_FIELDS, because those shaped the weights being
+    loaded. Everything else is a property of *this* invocation: how long to keep going,
+    on which device, at what learning rate, where to write.
+
+    `explicit` names the fields the caller actually passed. Silently discarding an
+    explicit `--chunk-size` that disagrees with the checkpoint would be the worst
+    outcome, so it raises instead; a value that merely came from a default is
+    overridden without comment.
+    """
+    checkpoint = resolve_resume_path(cfg.resume)
+    config_path = checkpoint.parent / "config.json"
+    if not config_path.exists():
+        raise SystemExit(
+            f"no config.json beside {checkpoint}. It records the architecture the "
+            "weights were trained under, and without it a resume would have to guess."
+        )
+
+    saved = json.loads(config_path.read_text())
+    conflicts = {name: (saved[name], getattr(cfg, name))
+                 for name in ARCHITECTURE_FIELDS
+                 if name in explicit and name in saved and saved[name] != getattr(cfg, name)}
+    if conflicts:
+        detail = "; ".join(f"--{name.replace('_', '-')}: checkpoint has {was!r}, "
+                           f"you passed {now!r}" for name, (was, now) in conflicts.items())
+        raise SystemExit(f"cannot change architecture while resuming — {detail}")
+
+    merged = {**asdict(cfg)}
+    for name in ARCHITECTURE_FIELDS:
+        if name in saved:
+            merged[name] = saved[name]
+    merged["output_dir"] = Path(merged["output_dir"])
+    merged["resume"] = checkpoint
+    return TrainConfig(**merged)
+
+
+def resolve_resume_path(path: Path) -> Path:
+    """Accept a checkpoint file, or a run directory holding `best.pt`/the latest step."""
+    path = Path(path)
+    if path.is_file():
+        return path
+    if path.is_dir():
+        best = path / "best.pt"
+        if best.is_file():
+            return best
+        steps = sorted(path.glob("step_*.pt"))
+        if steps:
+            return steps[-1]
+    raise SystemExit(f"no checkpoint at {path}")
 
 
 def build_datasets(cfg: TrainConfig):
@@ -365,11 +429,14 @@ class MetricsLog:
     running average hides that behind its own history.
     """
 
-    def __init__(self, path: Path, cfg: TrainConfig, counts: dict[str, int]) -> None:
+    def __init__(self, path: Path, cfg: TrainConfig, counts: dict[str, int],
+                 append: bool = False) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Truncate: a fresh run should not append to a previous run's curve.
-        with self.path.open("w") as handle:
+        # Truncate for a fresh run, so it does not append to a previous run's curve.
+        # A resume appends instead: the continuation is the same curve, and its own
+        # header line marks where it picked up.
+        with self.path.open("a" if append else "w") as handle:
             handle.write(json.dumps({
                 "type": "run",
                 "conditioning": cfg.conditioning,
@@ -453,6 +520,29 @@ def validate(model: DualSystem, loader, device: torch.device) -> float:
     return total / max(batches, 1)
 
 
+def restore(model: DualSystem, optimizer: torch.optim.Optimizer, path: Path,
+            device: torch.device) -> tuple[int, Path]:
+    """Load weights and optimiser state from `path`. Returns ``(next_step, path)``.
+
+    `strict=True`: a key or shape mismatch means the architecture does not match the one
+    that produced these weights, and continuing from a partially-loaded model would
+    train something that silently is not the checkpoint.
+
+    Checkpoints written before optimiser state was recorded still load; the moments
+    restart, which is announced rather than hidden because it perturbs the first few
+    hundred updates.
+    """
+    checkpoint_path = resolve_resume_path(path)
+    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(payload["state_dict"], strict=True)
+    if "optimizer" in payload:
+        optimizer.load_state_dict(payload["optimizer"])
+    else:
+        print(f"NOTE: {checkpoint_path.name} carries no optimiser state; Adam's moment "
+              "estimates restart from zero.")
+    return int(payload["step"]), checkpoint_path
+
+
 # ------------------------------------------------------------------------- loop
 
 
@@ -480,6 +570,10 @@ def train(cfg: TrainConfig) -> Path:
     optimizer = build_optimizer(model, cfg)
     counts = model.parameter_counts()
 
+    start_step, resumed_from = 0, None
+    if cfg.resume is not None:
+        start_step, resumed_from = restore(model, optimizer, cfg.resume, device)
+
     output_dir = Path(cfg.output_dir) / cfg.conditioning
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "config.json").write_text(
@@ -497,12 +591,15 @@ def train(cfg: TrainConfig) -> Path:
     print(f"scored on    : {scoring}")
     print(f"trainable    : {counts['trainable'] / 1e6:.2f}M of {counts['total'] / 1e6:.2f}M")
     print(f"device       : {device}")
+    if resumed_from is not None:
+        print(f"resumed      : {resumed_from} at step {start_step}")
     print(f"metrics      : {output_dir / 'metrics.jsonl'}\n")
 
-    metrics = MetricsLog(output_dir / "metrics.jsonl", cfg, counts)
+    metrics = MetricsLog(output_dir / "metrics.jsonl", cfg, counts,
+                         append=cfg.resume is not None)
 
     model.train()
-    step, started = 0, time.time()
+    step, started = start_step, time.time()
     # Reconstruction and KLD are accumulated apart: their sum hides whether a stalled
     # run is failing to fit the actions or being dominated by the regulariser.
     running = 0.0
@@ -561,20 +658,26 @@ def train(cfg: TrainConfig) -> Path:
                     # A stable filename so evaluation never has to guess which step to
                     # take from a directory of checkpoints.
                     save_checkpoint(model, cfg, step, output_dir,
-                                    filename="best.pt", val_loss=val_loss)
+                                    filename="best.pt", val_loss=val_loss,
+                                    optimizer=optimizer)
             if step % cfg.checkpoint_every == 0:
-                save_checkpoint(model, cfg, step, output_dir)
+                save_checkpoint(model, cfg, step, output_dir, optimizer=optimizer)
 
-    final = save_checkpoint(model, cfg, step, output_dir)
+    final = save_checkpoint(model, cfg, step, output_dir, optimizer=optimizer)
     print(f"\nfinished at step {step}: {final}")
     return final
 
 
 def save_checkpoint(model: DualSystem, cfg: TrainConfig, step: int, output_dir: Path,
-                    filename: str | None = None, val_loss: float | None = None) -> Path:
+                    filename: str | None = None, val_loss: float | None = None,
+                    optimizer: torch.optim.Optimizer | None = None) -> Path:
     path = output_dir / (filename or f"step_{step:07d}.pt")
     payload = {"step": step, "conditioning": cfg.conditioning,
                "state_dict": model.state_dict()}
+    if optimizer is not None:
+        # Adam's moments are part of the training state, not a nicety: resuming without
+        # them restarts the moment estimates and perturbs the first few hundred updates.
+        payload["optimizer"] = optimizer.state_dict()
     if val_loss is not None:
         payload["val_loss"] = val_loss
     torch.save(payload, path)
@@ -587,6 +690,10 @@ def save_checkpoint(model: DualSystem, cfg: TrainConfig, step: int, output_dir: 
 def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--resume", type=Path, default=None,
+                   help="continue from a checkpoint, or from a run directory (best.pt, "
+                        "else the latest step_*.pt). Architecture settings come from "
+                        "that run's config.json; everything else from this command")
     p.add_argument("--conditioning", default=TrainConfig.conditioning,
                    choices=["live", "static"],
                    help="'live' produces CKPT-DUAL, 'static' the naive-baseline CKPT-STATIC")
@@ -599,8 +706,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--lr-system2", type=float, default=TrainConfig.lr_system2)
     p.add_argument("--system1-arch", default=TrainConfig.system1_arch,
                    choices=list(SYSTEM1_ARCHS),
-                   help="System 1 implementation: 'act' wraps LeRobot's ACT (default), "
-                        "'scratch' uses the from-scratch encoder-decoder")
+                   help="System 1 implementation: 'scratch' uses the from-scratch "
+                        "encoder-decoder (default), 'act' wraps LeRobot's ACT")
     p.add_argument("--chunk-size", type=int, default=None,
                    help="actions predicted per forward pass; defaults to the value the "
                         "selected --system1-arch was designed around ("
@@ -630,7 +737,16 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p.add_argument("--log-every", type=int, default=TrainConfig.log_every)
     p.add_argument("--checkpoint-every", type=int, default=TrainConfig.checkpoint_every)
     args = p.parse_args(argv)
-    return TrainConfig(**vars(args))
+    config = TrainConfig(**vars(args))
+    if config.resume is None:
+        return config
+    # Which fields the caller actually named, as opposed to inherited from a default.
+    # `resume_config` needs the distinction: an explicit architecture flag that
+    # disagrees with the checkpoint is an error, an inherited one is simply replaced.
+    tokens = sys.argv[1:] if argv is None else argv
+    explicit = {token.lstrip("-").replace("-", "_").split("=")[0]
+                for token in tokens if token.startswith("--")}
+    return resume_config(config, explicit)
 
 
 if __name__ == "__main__":

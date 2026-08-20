@@ -68,8 +68,9 @@ SYSTEM1_ARCHS = ("act", "scratch")
 @dataclass
 class DualSystemConfig:
     system2: System2Config = field(default_factory=System2Config)
-    system1: System1Config | ScratchSystem1Config = field(default_factory=System1Config)
-    system1_arch: str = "act"
+    system1: ScratchSystem1Config | System1Config = field(
+        default_factory=ScratchSystem1Config)
+    system1_arch: str = "scratch"
 
     conditioning: Conditioning = Conditioning.LIVE
     latent_update_period: int = 10   # K, in environment steps
@@ -103,7 +104,7 @@ def tiny_config(**overrides) -> DualSystemConfig:
     from src.models.system2 import tiny_config as s2_tiny
 
     latent_dim = overrides.pop("latent_dim", 32)
-    arch = overrides.pop("system1_arch", "act")
+    arch = overrides.pop("system1_arch", "scratch")
     s1_tiny = act_tiny if arch == "act" else scratch_tiny
     return DualSystemConfig(
         system2=s2_tiny(latent_dim=latent_dim),

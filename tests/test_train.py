@@ -455,3 +455,100 @@ def test_chunk_size_follows_the_selected_architecture():
     assert parse_args(["--system1-arch", "scratch"]).chunk_size == 16
     # An explicit value wins over the architecture's default.
     assert parse_args(["--system1-arch", "scratch", "--chunk-size", "40"]).chunk_size == 40
+
+
+# ------------------------------------------------------------------------- resume
+
+
+def _seed_run(tmp_path, **config_overrides):
+    """A checkpoint plus the config.json a resume reads, without training anything."""
+    import json as json_module
+    from dataclasses import asdict
+
+    from src.train import TrainConfig, build_model, build_optimizer, save_checkpoint
+
+    defaults = dict(tiny=True, latent_dim=32, output_dir=tmp_path)
+    defaults.update(config_overrides)
+    cfg = TrainConfig(**defaults)
+    run_dir = tmp_path / cfg.conditioning
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "config.json").write_text(json_module.dumps(
+        {**asdict(cfg), "output_dir": str(tmp_path), "resume": None}, default=str))
+    model = build_model(cfg)
+    path = save_checkpoint(model, cfg, 4200, run_dir,
+                           optimizer=build_optimizer(model, cfg))
+    return cfg, path, run_dir
+
+
+def test_resume_takes_architecture_from_the_checkpoint(tmp_path):
+    """The weights were shaped by those fields; this invocation does not get a vote."""
+    from src.train import parse_args
+
+    _cfg, checkpoint, _run = _seed_run(tmp_path, system1_arch="scratch")
+    resumed = parse_args(["--resume", str(checkpoint), "--steps", "9999"])
+
+    assert resumed.system1_arch == "scratch"    # not the "act" default
+    assert resumed.chunk_size == 16             # follows the checkpoint's architecture
+    assert resumed.tiny is True
+    assert resumed.steps == 9999                # this run's business, not the checkpoint's
+
+
+def test_resume_rejects_an_explicit_architecture_change(tmp_path):
+    """Silently ignoring the flag would be worse than refusing it."""
+    from src.train import parse_args
+
+    _cfg, checkpoint, _run = _seed_run(tmp_path, system1_arch="scratch")
+    with pytest.raises(SystemExit, match="cannot change architecture"):
+        parse_args(["--resume", str(checkpoint), "--system1-arch", "act"])
+
+
+def test_resume_accepts_a_run_directory(tmp_path):
+    from src.train import parse_args
+
+    _cfg, checkpoint, run_dir = _seed_run(tmp_path)
+    assert parse_args(["--resume", str(run_dir)]).resume == checkpoint
+
+    best = run_dir / "best.pt"
+    best.write_bytes(checkpoint.read_bytes())
+    assert parse_args(["--resume", str(run_dir)]).resume == best   # best.pt wins
+
+
+def test_resume_restores_step_and_optimizer_state(tmp_path):
+    import torch
+
+    from src.train import TrainConfig, build_model, build_optimizer, restore
+
+    cfg, checkpoint, _run = _seed_run(tmp_path)
+    model = build_model(cfg)
+    optimizer = build_optimizer(model, cfg)
+    step, path = restore(model, optimizer, checkpoint, torch.device("cpu"))
+
+    assert step == 4200
+    assert path == checkpoint
+
+
+def test_resume_without_optimizer_state_still_loads(tmp_path, capsys):
+    """Checkpoints predate optimiser state being saved; they must remain resumable."""
+    import torch
+
+    from src.train import build_model, build_optimizer, restore
+
+    cfg, checkpoint, _run = _seed_run(tmp_path)
+    payload = torch.load(checkpoint, weights_only=False)
+    del payload["optimizer"]
+    torch.save(payload, checkpoint)
+
+    model = build_model(cfg)
+    step, _path = restore(model, build_optimizer(model, cfg), checkpoint,
+                          torch.device("cpu"))
+    assert step == 4200
+    assert "no optimiser state" in capsys.readouterr().out
+
+
+def test_resume_needs_the_config_sidecar(tmp_path):
+    from src.train import parse_args
+
+    _cfg, checkpoint, run_dir = _seed_run(tmp_path)
+    (run_dir / "config.json").unlink()
+    with pytest.raises(SystemExit, match="no config.json"):
+        parse_args(["--resume", str(checkpoint)])

@@ -124,6 +124,10 @@ class TrainConfig:
     # Smoke-test mode: overfit this many episodes. Passing a small number here is the
     # §1 training gate — loss must fall, gradients must reach System 2.
     overfit_episodes: int | None = None
+
+    # Harvested recovery segments, mixed into training at a stated share of each batch.
+    recovery_data: Path | None = None
+    recovery_fraction: float = 0.15
     tiny: bool = False   # small random models, for testing the loop itself
     # Checkpoint to continue from. The fields in ARCHITECTURE_FIELDS are then taken
     # from that run's config.json rather than from this one; see `resume_config`.
@@ -275,14 +279,71 @@ def build_datasets(cfg: TrainConfig):
         train_dataset = LeRobotDataset(REPO_ID, episodes=train_episodes, delta_timestamps=deltas)
         return train_dataset, None, False
 
-    train_dataset = LeRobotDataset(REPO_ID, episodes=sorted(train_episodes), delta_timestamps=deltas)
+    demonstrations = LeRobotDataset(REPO_ID, episodes=sorted(train_episodes),
+                                    delta_timestamps=deltas)
+    train_dataset = mix_recovery(demonstrations, cfg)
     if val_episodes:
         score_dataset = LeRobotDataset(REPO_ID, episodes=sorted(val_episodes),
                                        delta_timestamps=deltas)
         return train_dataset, score_dataset, True
-    # Nothing withheld: score the training episodes themselves. `validation_subset`
-    # strides across them, so the sample spans every task rather than the first few.
-    return train_dataset, train_dataset, False
+    # Nothing withheld: score the training episodes themselves — the *demonstrations*,
+    # never the mixture. Recovery frames are off the demonstrated manifold by
+    # construction, so a loss over them would move for two reasons at once and stop
+    # being comparable to the run this one resumes. `validation_subset` strides across
+    # the episodes, so the sample spans every task rather than the first few.
+    return train_dataset, demonstrations, False
+
+
+def demonstrations_of(dataset):
+    """The underlying demonstration dataset, unwrapping the recovery mixture if present.
+
+    Everything that reads episode structure — the task mapping, benchmark trials,
+    normalisation statistics — is a property of the demonstrations alone; a
+    `ConcatDataset` carries none of that surface, and the recovery half has no episodes
+    to enumerate.
+    """
+    from torch.utils.data import ConcatDataset
+
+    return dataset.datasets[0] if isinstance(dataset, ConcatDataset) else dataset
+
+
+def mix_recovery(demonstrations, cfg: TrainConfig):
+    """Concatenate harvested recovery segments onto the demonstrations, if any are given.
+
+    The scoring pass deliberately does not see them. Recovery frames are off the
+    demonstrated manifold by construction, so a loss that included them would move for
+    two reasons at once and stop being comparable to the run it continues.
+    """
+    if cfg.recovery_data is None:
+        return demonstrations
+
+    from torch.utils.data import ConcatDataset
+
+    from src.recovery_data import RecoverySegmentDataset
+
+    recovery = RecoverySegmentDataset(cfg.recovery_data, cfg.chunk_size,
+                                      cfg.temporal_offset)
+    print(f"recovery data: {recovery.summary()}")
+    return ConcatDataset([demonstrations, recovery])
+
+
+def recovery_sampler(dataset, cfg: TrainConfig):
+    """Draw `recovery_fraction` of every batch from the recovery half.
+
+    Weighting rather than truncating: the segments are a small fraction of the frames, so
+    an unweighted concatenation would show the policy a recovery roughly once a batch and
+    the added mode would never take. The weights make the fraction a stated
+    hyperparameter instead of an artefact of how many segments the harvest happened to
+    yield.
+    """
+    from torch.utils.data import WeightedRandomSampler
+
+    demonstrations, recovery = dataset.datasets
+    n_demo, n_recovery = len(demonstrations), len(recovery)
+    share = cfg.recovery_fraction
+    weights = ([(1.0 - share) / n_demo] * n_demo) + ([share / n_recovery] * n_recovery)
+    return WeightedRandomSampler(weights, num_samples=n_demo + n_recovery,
+                                 replacement=True)
 
 
 def split_batch(batch: dict) -> tuple[ModelObservation, list, torch.Tensor, torch.Tensor, list[str]]:
@@ -676,8 +737,11 @@ def train(cfg: TrainConfig) -> Path:
     device = torch.device(cfg.device)
 
     dataset, score_dataset, score_is_held_out = build_datasets(cfg)
+    # With recovery data mixed in, the sampler sets the share each batch draws from it,
+    # and shuffling is the sampler's job rather than the loader's.
+    sampler = recovery_sampler(dataset, cfg) if cfg.recovery_data is not None else None
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=cfg.batch_size, shuffle=True,
+        dataset, batch_size=cfg.batch_size, shuffle=sampler is None, sampler=sampler,
         num_workers=cfg.num_workers, pin_memory=device.type == "cuda", drop_last=True,
     )
     val_loader = None
@@ -691,7 +755,7 @@ def train(cfg: TrainConfig) -> Path:
             pin_memory=device.type == "cuda", drop_last=False,
         )
 
-    model = build_model(cfg, stats=system1_stats(dataset, cfg)).to(device)
+    model = build_model(cfg, stats=system1_stats(demonstrations_of(dataset), cfg)).to(device)
     optimizer = build_optimizer(model, cfg)
     counts = model.parameter_counts()
 
@@ -702,7 +766,7 @@ def train(cfg: TrainConfig) -> Path:
 
     gate = None
     if cfg.gate_rollouts and cfg.val_every > 0 and not cfg.tiny:
-        gate = RolloutGate(dataset, cfg, device)
+        gate = RolloutGate(demonstrations_of(dataset), cfg, device)
 
     output_dir = Path(cfg.output_dir) / cfg.conditioning
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -943,6 +1007,16 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     testing.add_argument("--overfit-episodes", type=int, default=None,
                          help="overfit this many episodes — the §1 training smoke-test "
                               "gate")
+
+    recovery = p.add_argument_group(
+        "recovery data",
+        "Harvested recovery segments, mixed into the demonstrations at a fixed share of "
+        "each batch. Absent these flags the run is a plain behaviour-cloning run.")
+    recovery.add_argument("--recovery-data", type=Path, default=TrainConfig.recovery_data,
+                          help="directory of .npz segments from scripts/harvest_recovery.py")
+    recovery.add_argument("--recovery-fraction", type=float,
+                          default=TrainConfig.recovery_fraction,
+                          help="share of each batch drawn from the recovery segments")
 
     args = p.parse_args(argv)
     config = TrainConfig(**vars(args))

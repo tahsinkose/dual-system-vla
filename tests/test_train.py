@@ -641,3 +641,53 @@ def test_gate_is_skipped_when_it_cannot_mean_anything():
                 TrainConfig(gate_rollouts=False)):
         enabled = cfg.gate_rollouts and cfg.val_every > 0 and not cfg.tiny
         assert enabled is False
+
+
+# --------------------------------------------------------------------- recovery mix
+
+
+def test_gate_and_stats_read_through_the_recovery_mixture(monkeypatch, tmp_path):
+    """Mixing recovery segments must not change what the episode-structured consumers see.
+
+    The task mapping, benchmark trials and normalisation statistics are properties of
+    the demonstrations; handing them the `ConcatDataset` raises on the missing episode
+    surface, and handing the scoring pass the mixture would move its loss for two
+    reasons at once.
+    """
+    from torch.utils.data import ConcatDataset
+
+    from src.train import TrainConfig, build_datasets, demonstrations_of
+
+    class _FakeDemos:
+        num_episodes = 5
+
+        def __init__(self, repo_id, episodes=None, delta_timestamps=None):
+            self.episodes = list(episodes) if episodes is not None else []
+
+        def __len__(self):
+            return 50
+
+    class _FakeRecovery:
+        def __init__(self, path, chunk_size, temporal_offset):
+            pass
+
+        def summary(self):
+            return "fake"
+
+        def __len__(self):
+            return 10
+
+    monkeypatch.setattr("lerobot.datasets.lerobot_dataset.LeRobotDataset", _FakeDemos)
+    monkeypatch.setattr("lerobot.datasets.lerobot_dataset.LeRobotDatasetMetadata",
+                        lambda repo_id: type("M", (), {"fps": 10})())
+    monkeypatch.setattr("src.utils.episodes_for_task", lambda dataset, t: [0, 1, 2, 3, 4])
+    monkeypatch.setattr("src.recovery_data.RecoverySegmentDataset", _FakeRecovery)
+
+    cfg = TrainConfig(val_fraction=0.0, task_indices=[0], recovery_data=tmp_path)
+    train_dataset, score_dataset, held_out = build_datasets(cfg)
+
+    assert isinstance(train_dataset, ConcatDataset)      # training sees the mixture
+    assert isinstance(score_dataset, _FakeDemos)         # scoring never does
+    assert held_out is False
+    assert demonstrations_of(train_dataset) is score_dataset
+    assert demonstrations_of(score_dataset) is score_dataset   # no-op without a mixture

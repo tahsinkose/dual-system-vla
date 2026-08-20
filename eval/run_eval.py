@@ -19,7 +19,7 @@ Examples::
 
     python -m eval.run_eval --checkpoint outputs/train/live --task-indices 0 --horizon 200
     python -m eval.run_eval --checkpoint outputs/train/live --conditioning zero \\
-        --perturb displace_object --perturb-at-step 50 --video-dir outputs/eval/videos
+        --perturb displace_object --perturb-at-step 50 --video
 """
 
 from __future__ import annotations
@@ -79,10 +79,12 @@ class EvalConfig:
     post_success_steps: int = 25             # steps to keep running after the goal is
                                               # first satisfied; see run_episode
     camera_size: int = 256
-    video_dir: Path | None = None
-    log_path: Path = Path("outputs/eval/results.jsonl")
-    latent_trace: bool = False
-    trace_dir: Path | None = None            # per-step .npz diagnostics per episode
+    # Every artifact of a run lands under one directory, at a fixed leaf name, so a run
+    # is one thing to find, archive or delete rather than three paths to keep in step.
+    output_dir: Path = Path("outputs/eval")
+    video: bool = False                      # <output_dir>/videos/<trial>.mp4
+    trace: bool = False                      # <output_dir>/traces/<trial>.npz
+    latent_trace: bool = False               # <output_dir>/latents/<trial>.npz
     allow_unmatched_episodes: bool = False   # run episodes with no recovered init state
                                               # (object layout will not match the recording)
     device: str = DEFAULT_DEVICE
@@ -91,11 +93,7 @@ class EvalConfig:
 
     def __post_init__(self) -> None:
         self.checkpoint = Path(self.checkpoint)
-        if self.video_dir is not None:
-            self.video_dir = Path(self.video_dir)
-        self.log_path = Path(self.log_path)
-        if self.trace_dir is not None:
-            self.trace_dir = Path(self.trace_dir)
+        self.output_dir = Path(self.output_dir)
 
         kind = PerturbationKind(self.perturb)
         trigger_fields = (self.perturb_at_step, self.perturb_after_success_steps)
@@ -108,6 +106,13 @@ class EvalConfig:
         if kind is PerturbationKind.UNDO_PROGRESS and self.perturb_after_success_steps is None:
             print("WARNING: --perturb undo_progress without --perturb-after-success-steps triggers on a "
                   "raw step count instead of 'N steps after task completion' — likely not what you want.")
+
+
+def artifact_dir(cfg: "EvalConfig", kind: str) -> Path:
+    """`<output_dir>/<kind>`, created on demand. The leaf names are not configurable."""
+    path = cfg.output_dir / kind
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def build_env(task, camera_size: int, horizon: int):
@@ -211,7 +216,7 @@ def run_episode(
     # policy actually starts from.
     subtasks = subtasks_for(trial.bddl)
     tracker = SubtaskTracker(subtasks, env)
-    tracer = RolloutTracer(env, subtasks) if cfg.trace_dir is not None else None
+    tracer = RolloutTracer(env, subtasks) if cfg.trace else None
     snapshot = snapshot_target_object_pose(env)   # baseline for UNDO_PROGRESS
     scheduler = PerturbationScheduler(perturbation)
     rng = perturbation.make_rng()
@@ -221,9 +226,9 @@ def run_episode(
     buffer.push(canon.images["image"][0])
 
     video = None
-    if cfg.video_dir is not None:
+    if cfg.video:
         video = RolloutVideoWriter(
-            cfg.video_dir / f"{trial.name}.mp4",
+            artifact_dir(cfg, "videos") / f"{trial.name}.mp4",
             eval_conditioning.value,
         )
     record_latents = cfg.latent_trace
@@ -299,11 +304,11 @@ def run_episode(
             video.close()
 
     if tracer is not None:
-        tracer.write(cfg.trace_dir / f"{trial.name}.npz")
+        tracer.write(artifact_dir(cfg, "traces") / f"{trial.name}.npz")
 
     latent_trace_path = None
     if record_latents and latents_trace:
-        latent_trace_path = cfg.log_path.parent / "latents" / f"{trial.name}.npz"
+        latent_trace_path = artifact_dir(cfg, "latents") / f"{trial.name}.npz"
         write_latent_trace(latent_trace_path, np.stack(latents_trace), np.array(steps_since_update_trace))
 
     recovered = None
@@ -357,7 +362,7 @@ def main(cfg: EvalConfig) -> list[EpisodeResult]:
         trigger = TriggerCondition(at_step=cfg.perturb_at_step,
                                    after_success_steps=cfg.perturb_after_success_steps)
 
-    writer = JsonlResultWriter(cfg.log_path)
+    writer = JsonlResultWriter(cfg.output_dir / "results.jsonl")
     results: list[EpisodeResult] = []
     try:
         for trial in trials:
@@ -423,15 +428,19 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
                         "the predicate flips. Does not change the reported success step; "
                         "ignored when a perturbation is configured, which runs to the horizon")
     p.add_argument("--camera-size", type=int, default=256)
-    p.add_argument("--video-dir", type=Path, default=None)
-    p.add_argument("--log-path", type=Path, default=Path("outputs/eval/results.jsonl"))
+    p.add_argument("--output-dir", type=Path, default=EvalConfig.output_dir,
+                   help="everything this run writes goes here: results.jsonl, and the "
+                        "videos/ traces/ latents/ subdirectories for whichever artifacts "
+                        "are enabled")
+    p.add_argument("--video", action="store_true",
+                   help="write <output-dir>/videos/<trial>.mp4, captioned")
+    p.add_argument("--trace", action="store_true",
+                   help="write <output-dir>/traces/<trial>.npz — per-step state, actions, "
+                        "subtask flags, object positions, object-to-goal distances. Pair "
+                        "with scripts/replay_episode.py --trace for the demonstration "
+                        "reference, then classify with scripts/analyze_traces.py")
     p.add_argument("--latent-trace", action="store_true",
-                   help="dump a full per-step latent trace per episode; opt-in, larger artifact")
-    p.add_argument("--trace-dir", type=Path, default=None,
-                   help="write a per-step diagnostic .npz per episode here (state, actions, "
-                        "subtask flags, object positions, object-to-goal distances). Pair with "
-                        "scripts/replay_episode.py --trace to get the demonstration reference, "
-                        "then classify with scripts/analyze_traces.py")
+                   help="write <output-dir>/latents/<trial>.npz; opt-in, larger artifact")
     p.add_argument("--allow-unmatched-episodes", action="store_true")
     p.add_argument("--device", default=DEFAULT_DEVICE)
     p.add_argument("--seed", type=int, default=0, help="seeds perturbation randomness per episode")

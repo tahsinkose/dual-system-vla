@@ -24,7 +24,7 @@ training time.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
 
 import torch
@@ -98,7 +98,8 @@ class DualSystemConfig:
 
 
 def tiny_config(**overrides) -> DualSystemConfig:
-    """Small end-to-end configuration for tests, for either System 1 architecture."""
+    """Small end-to-end configuration for tests, for either System 1 architecture.
+    """
     from src.models.system1 import tiny_config as act_tiny
     from src.models.system1_scratch import tiny_config as scratch_tiny
     from src.models.system2 import tiny_config as s2_tiny
@@ -106,11 +107,16 @@ def tiny_config(**overrides) -> DualSystemConfig:
     latent_dim = overrides.pop("latent_dim", 32)
     arch = overrides.pop("system1_arch", "scratch")
     s1_tiny = act_tiny if arch == "act" else scratch_tiny
+
+    dual_fields = {f.name for f in fields(DualSystemConfig)}
+    dual = {k: v for k, v in overrides.items() if k in dual_fields}
+    system1 = {k: v for k, v in overrides.items() if k not in dual_fields}
+
     return DualSystemConfig(
         system2=s2_tiny(latent_dim=latent_dim),
-        system1=s1_tiny(latent_dim=latent_dim),
+        system1=s1_tiny(latent_dim=latent_dim, **system1),
         system1_arch=arch,
-        **overrides,
+        **dual,
     )
 
 

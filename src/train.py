@@ -408,19 +408,16 @@ def build_model(cfg: TrainConfig, stats=None) -> DualSystem:
     """
     if cfg.tiny:
         from src.models.dual_system import tiny_config
-        if cfg.system1_arch == "act":
-            from src.models.system1 import tiny_config as system1_tiny
-        else:
-            from src.models.system1_scratch import tiny_config as system1_tiny
 
-        config = tiny_config(conditioning=Conditioning(cfg.conditioning),
-                             temporal_offset=cfg.temporal_offset,
-                             system1_arch=cfg.system1_arch)
-        # The dataset hands back chunks of cfg.chunk_size, so the model must predict
-        # that many regardless of what the tiny defaults say.
-        config.system1 = system1_tiny(latent_dim=config.system2.latent_dim,
-                                      chunk_size=cfg.chunk_size)
-        return DualSystem(config, system1_stats=stats)
+        # `chunk_size` is passed through rather than set afterwards: the dataset hands
+        # back chunks of that length, so the model must predict that many regardless of
+        # what the tiny defaults say.
+        return DualSystem(
+            tiny_config(conditioning=Conditioning(cfg.conditioning),
+                        temporal_offset=cfg.temporal_offset,
+                        system1_arch=cfg.system1_arch,
+                        chunk_size=cfg.chunk_size),
+            system1_stats=stats)
     system1_config = (System1Config if cfg.system1_arch == "act" else ScratchSystem1Config)(
         latent_dim=cfg.latent_dim, chunk_size=cfg.chunk_size)
     return DualSystem(DualSystemConfig(
@@ -562,7 +559,7 @@ class Restored:
 
 
 def restore(model: DualSystem, optimizer: torch.optim.Optimizer, path: Path,
-            device: torch.device) -> Restored:
+            device: torch.device | None = None) -> Restored:
     """Load weights and optimiser state from `path`.
 
     `strict=True`: a key or shape mismatch means the architecture does not match the one
@@ -572,9 +569,18 @@ def restore(model: DualSystem, optimizer: torch.optim.Optimizer, path: Path,
     Checkpoints written before optimiser state was recorded still load; the moments
     restart, which is announced rather than hidden because it perturbs the first few
     hundred updates.
+
+    `device` is accepted for call-site symmetry and unused: the payload is staged on CPU
+    and each consumer places its own tensors.
     """
+    del device
     checkpoint_path = resolve_resume_path(path)
-    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # Staged through CPU deliberately. Mapping straight onto the training device holds a
+    # second copy of the weights, plus the optimiser moments, alongside the model that is
+    # already there — enough to exhaust a 24GB card on a checkpoint this size.
+    # `load_state_dict` copies into the model's own device, and the optimiser moves its
+    # state to each parameter's device, so nothing needs to arrive pre-placed.
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model.load_state_dict(payload["state_dict"], strict=True)
     if "optimizer" in payload:
         optimizer.load_state_dict(payload["optimizer"])
@@ -611,9 +617,11 @@ class RolloutGate:
                                     task_indices=list(GATE_TASK_INDICES),
                                     trials_per_task=cfg.gate_trials_per_task)
         self._conditioning = Conditioning(cfg.conditioning)
+        # The gate writes no artifacts — its result is the returned rate — but the
+        # config still needs somewhere to point, and the run's own directory is it.
         self._eval_cfg = EvalConfig(checkpoint=Path("in-training"),
                                     horizon=cfg.gate_horizon,
-                                    log_path=Path(cfg.output_dir) / "gate.jsonl")
+                                    output_dir=Path(cfg.output_dir) / "gate")
 
     def __len__(self) -> int:
         return len(self._trials)
@@ -856,64 +864,86 @@ def save_checkpoint(model: DualSystem, cfg: TrainConfig, step: int, output_dir: 
 def parse_args(argv: list[str] | None = None) -> TrainConfig:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--resume", type=Path, default=None,
-                   help="continue from a checkpoint, or from a run directory (best.pt, "
-                        "else the latest step_*.pt). Architecture settings come from "
-                        "that run's config.json; everything else from this command")
-    p.add_argument("--conditioning", default=TrainConfig.conditioning,
-                   choices=["live", "static"],
-                   help="'live' produces CKPT-DUAL, 'static' the naive-baseline CKPT-STATIC")
-    p.add_argument("--output-dir", type=Path, default=TrainConfig.output_dir)
-    p.add_argument("--steps", type=int, default=TrainConfig.steps)
-    p.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
-    p.add_argument("--num-workers", type=int, default=TrainConfig.num_workers)
-    p.add_argument("--seed", type=int, default=TrainConfig.seed)
-    p.add_argument("--lr-system1", type=float, default=TrainConfig.lr_system1)
-    p.add_argument("--lr-system2", type=float, default=TrainConfig.lr_system2)
-    p.add_argument("--system1-arch", default=TrainConfig.system1_arch,
-                   choices=list(SYSTEM1_ARCHS),
-                   help="System 1 implementation: 'scratch' uses the from-scratch "
-                        "encoder-decoder (default), 'act' wraps LeRobot's ACT")
-    p.add_argument("--chunk-size", type=int, default=None,
-                   help="actions predicted per forward pass; defaults to the value the "
-                        "selected --system1-arch was designed around ("
-                        + ", ".join(f"{a}={n}" for a, n in DEFAULT_CHUNK_SIZE.items()) + ")")
-    p.add_argument("--kl-weight", type=float, default=TrainConfig.kl_weight,
-                   help="weight on the KLD term regularising the CVAE style latent")
-    p.add_argument("--temporal-offset", type=int, default=TrainConfig.temporal_offset,
-                   help="Δ₀: floor staleness of System 2's frame, in env steps")
-    p.add_argument("--device", default=TrainConfig.device)
-    p.add_argument("--task-indices", type=int, nargs="+", default=None,
-                   help="restrict to these dataset task indices (default: all ten)")
-    p.add_argument("--overfit-episodes", type=int, default=None,
-                   help="overfit this many episodes — the §1 training smoke-test gate")
-    p.add_argument("--tiny", action="store_true",
-                   help="small random models, for exercising the loop itself")
-    p.add_argument("--val-fraction", type=float, default=TrainConfig.val_fraction,
-                   help="fraction of each task's episodes held out from training and "
-                        "scored (default: 0, nothing withheld). At 0 every episode "
-                        "trains and the scoring pass runs in-sample: best.pt is still "
-                        "written, but the loss says nothing about generalisation. Above "
-                        "0 the held-out loss reveals overfitting, at the cost of that "
-                        "fraction of the training data. Either way the success metric "
-                        "comes from simulator rollouts against LIBERO's own initial "
-                        "states")
-    p.add_argument("--val-every", type=int, default=TrainConfig.val_every,
-                   help="steps between scoring passes; 0 disables them and best.pt")
-    p.add_argument("--no-gate-rollouts", dest="gate_rollouts", action="store_false",
-                   default=TrainConfig.gate_rollouts,
-                   help="select best.pt by loss instead of by in-simulator success rate")
-    p.add_argument("--gate-trials-per-task", type=int,
-                   default=TrainConfig.gate_trials_per_task,
-                   help=f"rollouts per gate task (default: "
-                        f"{TrainConfig.gate_trials_per_task}, over tasks "
-                        + ", ".join(str(i) for i in GATE_TASK_INDICES) + ")")
-    p.add_argument("--gate-horizon", type=int, default=TrainConfig.gate_horizon,
-                   help="max env steps per gate rollout")
-    p.add_argument("--val-samples", type=int, default=TrainConfig.val_samples,
-                   help="validation samples per pass, strided across every task")
-    p.add_argument("--log-every", type=int, default=TrainConfig.log_every)
-    p.add_argument("--checkpoint-every", type=int, default=TrainConfig.checkpoint_every)
+
+    run = p.add_argument_group("run")
+    run.add_argument("--conditioning", default=TrainConfig.conditioning,
+                     choices=["live", "static"],
+                     help="'live' produces CKPT-DUAL, 'static' the naive-baseline "
+                          "CKPT-STATIC")
+    run.add_argument("--output-dir", type=Path, default=TrainConfig.output_dir)
+    run.add_argument("--resume", type=Path, default=None,
+                     help="continue from a checkpoint, or from a run directory (best.pt, "
+                          "else the latest step_*.pt). Architecture settings come from "
+                          "that run's config.json; everything else from this command")
+    run.add_argument("--device", default=TrainConfig.device)
+    run.add_argument("--seed", type=int, default=TrainConfig.seed)
+
+    model = p.add_argument_group(
+        "model", "Shapes the weights. Continuing a run reuses these from its "
+                 "config.json rather than from the command line.")
+    model.add_argument("--system1-arch", default=TrainConfig.system1_arch,
+                       choices=list(SYSTEM1_ARCHS),
+                       help="System 1 implementation: 'scratch' uses the from-scratch "
+                            "encoder-decoder (default), 'act' wraps LeRobot's ACT")
+    model.add_argument("--chunk-size", type=int, default=None,
+                       help="actions predicted per forward pass; defaults to the value "
+                            "the selected --system1-arch was designed around ("
+                            + ", ".join(f"{a}={n}" for a, n in DEFAULT_CHUNK_SIZE.items())
+                            + ")")
+    model.add_argument("--temporal-offset", type=int, default=TrainConfig.temporal_offset,
+                       help="Δ₀: floor staleness of System 2's frame, in env steps")
+
+    optimisation = p.add_argument_group("optimisation")
+    optimisation.add_argument("--steps", type=int, default=TrainConfig.steps)
+    optimisation.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
+    optimisation.add_argument("--lr-system1", type=float, default=TrainConfig.lr_system1)
+    optimisation.add_argument("--lr-system2", type=float, default=TrainConfig.lr_system2)
+    optimisation.add_argument("--kl-weight", type=float, default=TrainConfig.kl_weight,
+                              help="weight on the KLD term regularising the CVAE style "
+                                   "latent; applies to --system1-arch act only")
+    optimisation.add_argument("--num-workers", type=int, default=TrainConfig.num_workers)
+
+    data = p.add_argument_group("data")
+    data.add_argument("--task-indices", type=int, nargs="+", default=None,
+                      help="restrict to these dataset task indices (default: all ten)")
+    data.add_argument("--val-fraction", type=float, default=TrainConfig.val_fraction,
+                      help="fraction of each task's episodes held out from training and "
+                           "scored (default: 0, nothing withheld)")
+
+    scoring = p.add_argument_group(
+        "scoring", "How often the run is scored, and what selects best.pt.")
+    scoring.add_argument("--val-every", type=int, default=TrainConfig.val_every,
+                         help="steps between scoring passes; 0 disables them and best.pt")
+    scoring.add_argument("--val-samples", type=int, default=TrainConfig.val_samples,
+                         help="validation samples per pass, strided across every task")
+    scoring.add_argument("--no-gate-rollouts", dest="gate_rollouts",
+                         action="store_false", default=TrainConfig.gate_rollouts,
+                         help="select best.pt by loss instead of by in-simulator "
+                              "success rate")
+    scoring.add_argument("--gate-trials-per-task", type=int,
+                         default=TrainConfig.gate_trials_per_task,
+                         help=f"rollouts per gate task (default: "
+                              f"{TrainConfig.gate_trials_per_task}, over tasks "
+                              + ", ".join(str(i) for i in GATE_TASK_INDICES) + ")")
+    scoring.add_argument("--gate-horizon", type=int, default=TrainConfig.gate_horizon,
+                         help="max env steps per gate rollout")
+
+    logging = p.add_argument_group("logging")
+    logging.add_argument("--log-every", type=int, default=TrainConfig.log_every)
+    logging.add_argument("--checkpoint-every", type=int,
+                         default=TrainConfig.checkpoint_every)
+
+    testing = p.add_argument_group(
+        "testing", "Exercise the loop, not the study. Neither belongs in a run whose "
+                   "numbers are reported: --tiny trains randomly-initialised stand-ins "
+                   "for both systems, and --overfit-episodes deliberately memorises a "
+                   "handful of episodes and skips the held-out split.")
+    testing.add_argument("--tiny", action="store_true",
+                         help="small random models, for exercising the loop itself")
+    testing.add_argument("--overfit-episodes", type=int, default=None,
+                         help="overfit this many episodes — the §1 training smoke-test "
+                              "gate")
+
     args = p.parse_args(argv)
     config = TrainConfig(**vars(args))
     if config.resume is None:

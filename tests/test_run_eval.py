@@ -119,8 +119,11 @@ def test_action_is_clipped_before_env_step():
     model = _tiny_model()
     env = _SpyEnv()
     cfg = _cfg(horizon=3)
+    # The two System 1 architectures keep their head at different depths: ACT's lives on
+    # the wrapped inner module, the scratch encoder-decoder's on the model itself.
+    head = getattr(model.system1, "action_head", None) or model.system1.act.action_head
     with torch.no_grad():
-        for p in model.system1.act.action_head.parameters():
+        for p in head.parameters():
             p.mul_(100.0)   # force out-of-range predictions
     _run(model, env, cfg)
     assert env.step_actions   # sanity: the loop actually ran
@@ -474,14 +477,14 @@ def test_end_to_end_tiny_model_rollout_on_real_env(tmp_path, init_source, extra_
         "--horizon", "10",
         "--settle-steps", "0",
         "--init-source", init_source,
-        "--log-path", str(tmp_path / "results.jsonl"),
-        "--video-dir", str(tmp_path / "videos"),
-        "--trace-dir", str(tmp_path / "traces"),
+        "--output-dir", str(tmp_path / "eval"),
+        "--video",
+        "--trace",
     ] + extra_args)
     results = main(eval_cfg)
 
     assert len(results) == 1
-    lines = (tmp_path / "results.jsonl").read_text().splitlines()
+    lines = (tmp_path / "eval" / "results.jsonl").read_text().splitlines()
     assert len(lines) == 1
     parsed = json.loads(lines[0])
     assert parsed["task_dataset_index"] == 0
@@ -489,7 +492,7 @@ def test_end_to_end_tiny_model_rollout_on_real_env(tmp_path, init_source, extra_
     assert 0 < parsed["subtasks_total"] <= len(parsed["subtasks"])
     assert all("first_achieved_step" in s for s in parsed["subtasks"])
 
-    videos = list((tmp_path / "videos").glob("*.mp4"))
+    videos = list((tmp_path / "eval" / "videos").glob("*.mp4"))
     assert len(videos) == 1
     assert videos[0].stat().st_size > 0
 
@@ -497,7 +500,7 @@ def test_end_to_end_tiny_model_rollout_on_real_env(tmp_path, init_source, extra_
     # what lets scripts/analyze_traces.py judge one against the other.
     from eval.trace import load_trace
 
-    traces = list((tmp_path / "traces").glob("*.npz"))
+    traces = list((tmp_path / "eval" / "traces").glob("*.npz"))
     assert len(traces) == 1
     trace = load_trace(traces[0])
     steps = len(trace["step"])

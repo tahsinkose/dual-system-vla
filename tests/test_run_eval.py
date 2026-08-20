@@ -434,7 +434,15 @@ def test_eval_config_warns_for_undo_progress_without_after_success_steps(capsys)
 
 
 @pytest.mark.slow
-def test_end_to_end_tiny_model_rollout_on_real_env(tmp_path):
+@pytest.mark.parametrize("init_source,extra_args", [
+    # The default path: LIBERO's own initial states, one trial to keep this cheap.
+    ("benchmark", ["--trials-per-task", "1"]),
+    # The debugging path: one specific demonstration. `--episodes` is only consulted
+    # for this source, and episode 0 has no recovered initial state, hence
+    # --allow-unmatched-episodes.
+    ("demo", ["--episodes", "0", "--allow-unmatched-episodes"]),
+])
+def test_end_to_end_tiny_model_rollout_on_real_env(tmp_path, init_source, extra_args):
     import json as json_module
 
     from src.env_setup import setup_env as _setup
@@ -465,11 +473,11 @@ def test_end_to_end_tiny_model_rollout_on_real_env(tmp_path):
         "--task-indices", "0",
         "--horizon", "10",
         "--settle-steps", "0",
-        "--allow-unmatched-episodes",
-        "--episodes", "0",
+        "--init-source", init_source,
         "--log-path", str(tmp_path / "results.jsonl"),
         "--video-dir", str(tmp_path / "videos"),
-    ])
+        "--trace-dir", str(tmp_path / "traces"),
+    ] + extra_args)
     results = main(eval_cfg)
 
     assert len(results) == 1
@@ -484,3 +492,18 @@ def test_end_to_end_tiny_model_rollout_on_real_env(tmp_path):
     videos = list((tmp_path / "videos").glob("*.mp4"))
     assert len(videos) == 1
     assert videos[0].stat().st_size > 0
+
+    # The diagnostic trace shares its schema with a replayed demonstration, which is
+    # what lets scripts/analyze_traces.py judge one against the other.
+    from eval.trace import load_trace
+
+    traces = list((tmp_path / "traces").glob("*.npz"))
+    assert len(traces) == 1
+    trace = load_trace(traces[0])
+    steps = len(trace["step"])
+    assert steps > 0
+    assert trace["state"].shape == (steps, 8)
+    assert trace["action"].shape == (steps, 7)
+    assert trace["subtask_done"].shape == (steps, len(trace["subtask_ids"]))
+    assert trace["goal_distance"].shape == (steps, len(trace["goal_ids"]))
+    assert trace["object_pos"].shape == (steps, len(trace["object_names"]), 3)

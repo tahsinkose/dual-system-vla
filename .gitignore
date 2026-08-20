@@ -31,3 +31,5 @@ data/*
 .DS_Store
 
 configs/libero/config.yaml
+# LaTeX build artifacts; report.pdf and report.tex are the deliverables
+report
